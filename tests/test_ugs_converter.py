@@ -3,16 +3,23 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from PIL import Image
+
 from ugs_converter import (
+    UgsError,
     build_ugs,
     create_backup,
     decode_ugs_pixel,
     encode_ugs_pixel,
     extract_ugs,
     inspect_ugs,
+    install_ugs,
     read_ugs,
     rotate_left_16,
     rotate_right_16,
+    split_sprite_sheet,
+    validate_frames,
+    write_ugs,
 )
 
 
@@ -70,6 +77,59 @@ class ContainerRoundTripTests(unittest.TestCase):
             self.assertEqual(second.name, "hero.ugs.bak.1")
             self.assertEqual(first.read_bytes(), b"original")
             self.assertEqual(second.read_bytes(), b"original")
+
+    def test_sprite_sheet_is_split_in_row_major_order(self) -> None:
+        sheet = Image.new("RGBA", (16, 16))
+        for index in range(64):
+            color = (index, 255 - index, index // 2, 255)
+            x = (index % 8) * 2
+            y = (index // 8) * 2
+            for pixel_y in range(y, y + 2):
+                for pixel_x in range(x, x + 2):
+                    sheet.putpixel((pixel_x, pixel_y), color)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "sheet.png"
+            sheet.save(source)
+            frames = split_sprite_sheet(source)
+
+        self.assertEqual(len(frames), 64)
+        self.assertTrue(all(frame.size == (2, 2) for frame in frames))
+        self.assertEqual(frames[0].getpixel((0, 0)), (0, 255, 0, 255))
+        self.assertEqual(frames[63].getpixel((0, 0)), (63, 192, 31, 255))
+
+    def test_validation_collects_size_error_and_count_warning(self) -> None:
+        report = validate_frames(
+            [Image.new("RGBA", (64, 64)), Image.new("RGBA", (32, 64))]
+        )
+        self.assertFalse(report.ok)
+        self.assertEqual(len(report.errors), 1)
+        self.assertEqual(len(report.warnings), 1)
+
+    def test_install_replaces_target_and_preserves_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "new.ugs"
+            target = root / "Hero-Knight.ugs"
+            write_ugs([Image.new("RGBA", (2, 1), (255, 0, 0, 255))], source)
+            write_ugs([Image.new("RGBA", (2, 1), (0, 255, 0, 255))], target)
+            original = target.read_bytes()
+
+            backup = install_ugs(source, target)
+
+            self.assertEqual(target.read_bytes(), source.read_bytes())
+            self.assertEqual(backup.read_bytes(), original)
+
+    def test_install_rejects_incompatible_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "new.ugs"
+            target = root / "target.ugs"
+            write_ugs([Image.new("RGBA", (2, 1))], source)
+            write_ugs([Image.new("RGBA", (1, 1))], target)
+
+            with self.assertRaises(UgsError):
+                install_ugs(source, target)
 
 
 if __name__ == "__main__":

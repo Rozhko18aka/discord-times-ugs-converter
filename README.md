@@ -13,6 +13,10 @@
 - защита от случайной замены существующего файла.
 - проверка UGS без распаковки;
 - резервная копия заменяемого UGS и быстрое открытие папки результата.
+- сетка всех 64 кадров 8×8 и анимированный предпросмотр выбранной строки;
+- перетаскивание PNG и папок в окно;
+- импорт спрайт-листа 8×8;
+- безопасная установка UGS в игру с проверкой совместимости и резервной копией.
 
 ## Быстрый запуск в Windows
 
@@ -37,6 +41,7 @@
 python ugs_converter.py extract "Hero-Knight.ugs" ".\hero_frames"
 python ugs_converter.py build ".\hero_frames" ".\Hero-Knight-new.ugs"
 python ugs_converter.py inspect "Hero-Knight.ugs"
+python ugs_converter.py install ".\Hero-Knight-new.ugs" "C:\путь\к\игре\Graphics\Units\Hero-Knight.ugs" --yes
 ```
 
 Добавьте `--force`, если разрешено заменить существующий выходной UGS.

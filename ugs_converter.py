@@ -35,6 +35,9 @@ except ImportError as exc:  # pragma: no cover - depends on the local Python ins
 
 XOR_MASK = 0xAAAA
 FRAME_NAME_RE = re.compile(r"^frame_(\d+)\.png$", re.IGNORECASE)
+GRID_COLUMNS = 8
+GRID_ROWS = 8
+UNIT_FRAME_COUNT = GRID_COLUMNS * GRID_ROWS
 
 
 class UgsError(Exception):
@@ -48,6 +51,19 @@ class UgsInfo:
     height: int
     file_size: int
     sha256: str
+
+
+@dataclass(frozen=True)
+class FrameSetReport:
+    frame_count: int
+    width: int | None
+    height: int | None
+    errors: tuple[str, ...]
+    warnings: tuple[str, ...]
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
 
 
 def rotate_left_16(value: int, count: int) -> int:
@@ -156,6 +172,47 @@ def create_backup(path: Path) -> Path:
     return candidate
 
 
+def install_ugs(source: Path, target: Path) -> Path:
+    """Validate and atomically install a UGS over an existing game file."""
+    source_info = inspect_ugs(source)
+    if not target.is_file():
+        raise UgsError(f"Файл игры не найден: {target}")
+    target_info = inspect_ugs(target)
+    source_layout = (source_info.frame_count, source_info.width, source_info.height)
+    target_layout = (target_info.frame_count, target_info.width, target_info.height)
+    if source_layout != target_layout:
+        raise UgsError(
+            "Новый UGS несовместим с заменяемым: "
+            f"{source_info.frame_count} кадров {source_info.width}×{source_info.height} вместо "
+            f"{target_info.frame_count} кадров {target_info.width}×{target_info.height}."
+        )
+    try:
+        if source.resolve() == target.resolve():
+            raise UgsError("Исходный файл и файл игры совпадают.")
+    except OSError as exc:
+        raise UgsError(f"Не удалось проверить пути: {exc}") from exc
+
+    backup = create_backup(target)
+    temporary_name: str | None = None
+    try:
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=target.name + ".", suffix=".install.tmp", dir=target.parent
+        )
+        with os.fdopen(fd, "wb") as temporary, source.open("rb") as incoming:
+            shutil.copyfileobj(incoming, temporary)
+        os.replace(temporary_name, target)
+    except OSError as exc:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except OSError:
+                pass
+        raise UgsError(
+            f"Не удалось установить UGS: {exc}. Исходный файл игры сохранён в {backup}"
+        ) from exc
+    return backup
+
+
 def open_in_file_manager(path: Path) -> None:
     """Open a directory (or select a file) using the platform file manager."""
     target = path if path.is_dir() else path.parent
@@ -168,6 +225,97 @@ def open_in_file_manager(path: Path) -> None:
             subprocess.Popen(["xdg-open", str(target)])
     except OSError as exc:
         raise UgsError(f"Не удалось открыть папку: {exc}") from exc
+
+
+def validate_frames(
+    frames: list[Image.Image], expected_count: int = UNIT_FRAME_COUNT
+) -> FrameSetReport:
+    """Collect all useful frame errors and non-blocking compatibility warnings."""
+    if not frames:
+        return FrameSetReport(0, None, None, ("Кадры не загружены.",), ())
+
+    width, height = frames[0].size
+    errors: list[str] = []
+    warnings: list[str] = []
+    if width <= 0 or height <= 0:
+        errors.append("Размер первого кадра некорректен.")
+    if width > 65535 or height > 65535:
+        errors.append("Размер кадра не помещается в формат UGS.")
+
+    wrong_sizes = [
+        index for index, frame in enumerate(frames) if frame.size != (width, height)
+    ]
+    if wrong_sizes:
+        shown = ", ".join(str(index) for index in wrong_sizes[:10])
+        suffix = "…" if len(wrong_sizes) > 10 else ""
+        errors.append(f"Кадры другого размера: {shown}{suffix}.")
+
+    if len(frames) != expected_count:
+        warnings.append(
+            f"Для сетки 8×8 ожидается {expected_count} кадров, загружено {len(frames)}."
+        )
+
+    return FrameSetReport(
+        frame_count=len(frames),
+        width=width,
+        height=height,
+        errors=tuple(errors),
+        warnings=tuple(warnings),
+    )
+
+
+def load_png_frames(paths: list[Path]) -> list[Image.Image]:
+    """Load PNG files in natural filename order."""
+    if not paths:
+        raise UgsError("PNG-файлы не выбраны.")
+
+    def natural_key(path: Path) -> list[object]:
+        return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", path.name)]
+
+    frames: list[Image.Image] = []
+    for path in sorted(paths, key=natural_key):
+        if path.suffix.lower() != ".png":
+            continue
+        try:
+            with Image.open(path) as opened:
+                frames.append(opened.convert("RGBA"))
+        except OSError as exc:
+            raise UgsError(f"Не удалось прочитать {path.name}: {exc}") from exc
+    if not frames:
+        raise UgsError("Среди выбранных файлов нет PNG.")
+    return frames
+
+
+def split_sprite_sheet(
+    source: Path, columns: int = GRID_COLUMNS, rows: int = GRID_ROWS
+) -> list[Image.Image]:
+    """Split a regularly spaced sprite sheet into row-major frames."""
+    try:
+        with Image.open(source) as opened:
+            sheet = opened.convert("RGBA")
+    except OSError as exc:
+        raise UgsError(f"Не удалось прочитать спрайт-лист: {exc}") from exc
+    if sheet.width % columns or sheet.height % rows:
+        raise UgsError(
+            f"Размер спрайт-листа {sheet.width}×{sheet.height} не делится на сетку "
+            f"{columns}×{rows}."
+        )
+    frame_width = sheet.width // columns
+    frame_height = sheet.height // rows
+    if frame_width == 0 or frame_height == 0:
+        raise UgsError("Ячейки спрайт-листа имеют нулевой размер.")
+    return [
+        sheet.crop(
+            (
+                column * frame_width,
+                row * frame_height,
+                (column + 1) * frame_width,
+                (row + 1) * frame_height,
+            )
+        )
+        for row in range(rows)
+        for column in range(columns)
+    ]
 
 
 def make_preview(frames: list[Image.Image], columns: int = 8) -> Image.Image:
@@ -254,6 +402,48 @@ def read_expected_metadata(input_dir: Path) -> dict[str, object] | None:
     return metadata
 
 
+def write_ugs(
+    frames: list[Image.Image], destination: Path, overwrite: bool = False
+) -> tuple[int, tuple[int, int]]:
+    report = validate_frames(frames)
+    if report.errors:
+        raise UgsError("\n".join(report.errors))
+    if destination.exists() and not overwrite:
+        raise UgsError(f"Файл уже существует: {destination}. Используйте --force для замены.")
+
+    output = bytearray()
+    expected_size = frames[0].size
+    for index, source_frame in enumerate(frames):
+        frame = source_frame.convert("RGBA")
+        if frame.size != expected_size:
+            raise UgsError(
+                f"Кадр {index}: размер {frame.width}×{frame.height}, "
+                f"ожидался {expected_size[0]}×{expected_size[1]}."
+            )
+        output.extend(struct.pack("<HH", frame.width, frame.height))
+        pixels = frame.get_flattened_data() if hasattr(frame, "get_flattened_data") else frame.getdata()
+        for red, green, blue, alpha in pixels:
+            output.extend(struct.pack("<H", encode_ugs_pixel(red, green, blue, alpha)))
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_name: str | None = None
+    try:
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=destination.name + ".", suffix=".tmp", dir=destination.parent
+        )
+        with os.fdopen(fd, "wb") as temporary:
+            temporary.write(output)
+        os.replace(temporary_name, destination)
+    except OSError as exc:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except OSError:
+                pass
+        raise UgsError(f"Не удалось записать UGS: {exc}") from exc
+    return len(frames), expected_size
+
+
 def build_ugs(input_dir: Path, destination: Path, overwrite: bool = False) -> tuple[int, tuple[int, int]]:
     frame_paths = find_frames(input_dir)
     metadata = read_expected_metadata(input_dir)
@@ -270,88 +460,419 @@ def build_ugs(input_dir: Path, destination: Path, overwrite: bool = False) -> tu
                 f"Количество кадров не совпадает с ugs_info.json: "
                 f"найдено {len(frame_paths)}, ожидалось {expected_count}."
             )
-    if destination.exists() and not overwrite:
-        raise UgsError(f"Файл уже существует: {destination}. Используйте --force для замены.")
-
-    output = bytearray()
-    expected_size: tuple[int, int] | None = None
-
-    for index, frame_path in enumerate(frame_paths):
-        try:
-            with Image.open(frame_path) as opened:
-                frame = opened.convert("RGBA")
-        except OSError as exc:
-            raise UgsError(f"Не удалось прочитать {frame_path.name}: {exc}") from exc
-
-        if expected_size is None:
-            expected_size = frame.size
-            if frame.width > 65535 or frame.height > 65535:
-                raise UgsError("Размер кадра не помещается в формат UGS.")
-            if metadata is not None:
-                metadata_width = metadata.get("width")
-                metadata_height = metadata.get("height")
-                if isinstance(metadata_width, int) and isinstance(metadata_height, int):
-                    if frame.size != (metadata_width, metadata_height):
-                        raise UgsError(
-                            f"Размер кадров не совпадает с ugs_info.json: "
-                            f"получен {frame.width}x{frame.height}, "
-                            f"ожидался {metadata_width}x{metadata_height}."
-                        )
-        elif frame.size != expected_size:
-            raise UgsError(
-                f"{frame_path.name}: размер {frame.width}×{frame.height}, "
-                f"ожидался {expected_size[0]}×{expected_size[1]}."
-            )
-
-        output.extend(struct.pack("<HH", frame.width, frame.height))
-        pixels = frame.get_flattened_data() if hasattr(frame, "get_flattened_data") else frame.getdata()
-        for red, green, blue, alpha in pixels:
-            value = encode_ugs_pixel(red, green, blue, alpha)
-            output.extend(struct.pack("<H", value))
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        fd, temporary_name = tempfile.mkstemp(prefix=destination.name + ".", suffix=".tmp", dir=destination.parent)
-        with os.fdopen(fd, "wb") as temporary:
-            temporary.write(output)
-        os.replace(temporary_name, destination)
-    except OSError as exc:
-        try:
-            os.unlink(temporary_name)
-        except (OSError, UnboundLocalError):
-            pass
-        raise UgsError(f"Не удалось записать UGS: {exc}") from exc
-
-    assert expected_size is not None
-    return len(frame_paths), expected_size
+    frames = load_png_frames(frame_paths)
+    if metadata is not None:
+        metadata_width = metadata.get("width")
+        metadata_height = metadata.get("height")
+        if isinstance(metadata_width, int) and isinstance(metadata_height, int):
+            if frames[0].size != (metadata_width, metadata_height):
+                raise UgsError(
+                    f"Размер кадров не совпадает с ugs_info.json: "
+                    f"получен {frames[0].width}x{frames[0].height}, "
+                    f"ожидался {metadata_width}x{metadata_height}."
+                )
+    return write_ugs(frames, destination, overwrite)
 
 
 def run_gui() -> None:
     import tkinter as tk
-    from tkinter import filedialog, messagebox
+    from tkinter import filedialog, messagebox, ttk
+    from PIL import ImageTk
 
-    root = tk.Tk()
+    try:
+        from tkinterdnd2 import DND_FILES, TkinterDnD
+    except ImportError:
+        DND_FILES = None
+        TkinterDnD = None
+
+    root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
     root.title("Discord Times — UGS Converter")
-    root.geometry("560x315")
-    root.resizable(False, False)
+    root.geometry("1100x690")
+    root.minsize(1020, 640)
     last_directory = Path.cwd()
+    frames: list[Image.Image] = []
+    grid_photos: list[ImageTk.PhotoImage] = []
+    animation_photo: ImageTk.PhotoImage | None = None
+    animation_position = 0
+    animation_running = True
+    last_built_ugs: Path | None = None
+    suggested_stem = "sprites"
 
-    title = tk.Label(root, text="Конвертер спрайтов UGS", font=("Segoe UI", 16, "bold"))
-    title.pack(pady=(22, 8))
-    info = tk.Label(
-        root,
-        text=(
-            "Распаковывает UGS в отдельные PNG и собирает их обратно.\n"
-            "Цвет и 16 уровней прозрачности PNG сохраняются в игровом формате."
-        ),
-        justify="center",
-        font=("Segoe UI", 10),
+    outer = ttk.Frame(root, padding=12)
+    outer.pack(fill="both", expand=True)
+    controls = ttk.Frame(outer, width=350)
+    controls.pack(side="left", fill="y", padx=(0, 14))
+    preview = ttk.Frame(outer)
+    preview.pack(side="left", fill="both", expand=True)
+
+    ttk.Label(controls, text="UGS Converter", font=("Segoe UI", 18, "bold")).pack(
+        anchor="w", pady=(2, 4)
     )
-    info.pack(pady=(0, 20))
+    ttk.Label(
+        controls,
+        text="Загрузите 64 PNG, папку кадров, UGS или спрайт-лист 8×8.",
+        wraplength=330,
+        justify="left",
+    ).pack(anchor="w", pady=(0, 12))
+
+    source_var = tk.StringVar(value="Кадры не загружены")
+    status_var = tk.StringVar(
+        value=(
+            "Перетащите PNG или папку в окно."
+            if DND_FILES is not None
+            else "Перетаскивание отключено: установите tkinterdnd2."
+        )
+    )
+    direction_var = tk.StringVar(value="1")
+    speed_var = tk.IntVar(value=140)
+
+    source_box = ttk.LabelFrame(controls, text="Текущий набор", padding=8)
+    source_box.pack(fill="x", pady=(0, 10))
+    ttk.Label(source_box, textvariable=source_var, wraplength=320).pack(anchor="w")
+    ttk.Label(source_box, textvariable=status_var, wraplength=320, foreground="#555555").pack(
+        anchor="w", pady=(4, 0)
+    )
+
+    grid_box = ttk.LabelFrame(preview, text="Сетка кадров 8×8", padding=8)
+    grid_box.pack(fill="both", expand=True)
+    grid_frame = ttk.Frame(grid_box)
+    grid_frame.pack(anchor="center")
+    grid_labels: list[ttk.Label] = []
+    for index in range(UNIT_FRAME_COUNT):
+        label = ttk.Label(
+            grid_frame,
+            text=f"{index:02d}",
+            width=7,
+            anchor="center",
+            relief="ridge",
+            padding=2,
+        )
+        label.grid(row=index // GRID_COLUMNS, column=index % GRID_COLUMNS, padx=1, pady=1)
+        grid_labels.append(label)
+
+    animation_box = ttk.LabelFrame(controls, text="Анимированный предпросмотр", padding=8)
+    animation_box.pack(fill="x", pady=(0, 10))
+    animation_label = ttk.Label(animation_box, text="Нет кадров", anchor="center")
+    animation_label.pack(fill="x", pady=(0, 6))
+    animation_controls = ttk.Frame(animation_box)
+    animation_controls.pack(fill="x")
+    ttk.Label(animation_controls, text="Строка:").pack(side="left")
+    direction_combo = ttk.Combobox(
+        animation_controls,
+        textvariable=direction_var,
+        values=[str(number) for number in range(1, GRID_ROWS + 1)],
+        width=3,
+        state="readonly",
+    )
+    direction_combo.pack(side="left", padx=(4, 8))
+    play_button = ttk.Button(animation_controls, text="Пауза", width=8)
+    play_button.pack(side="left")
+    ttk.Label(animation_box, text="Скорость, мс:").pack(anchor="w", pady=(7, 0))
+    ttk.Scale(animation_box, from_=60, to=500, variable=speed_var, orient="horizontal").pack(
+        fill="x"
+    )
 
     def remember(path: Path) -> None:
         nonlocal last_directory
         last_directory = path if path.is_dir() else path.parent
+
+    def checker_preview(frame: Image.Image, size: int) -> Image.Image:
+        background = Image.new("RGBA", (size, size), (68, 68, 68, 255))
+        draw = ImageDraw.Draw(background)
+        tile = max(6, size // 10)
+        for y in range(0, size, tile):
+            for x in range(0, size, tile):
+                shade = 52 if ((x // tile) + (y // tile)) % 2 else 74
+                draw.rectangle((x, y, x + tile - 1, y + tile - 1), fill=(shade,) * 3 + (255,))
+        scale = min(size / frame.width, size / frame.height)
+        scaled_size = (max(1, round(frame.width * scale)), max(1, round(frame.height * scale)))
+        scaled = frame.convert("RGBA").resize(scaled_size, Image.Resampling.NEAREST)
+        background.alpha_composite(
+            scaled, ((size - scaled.width) // 2, (size - scaled.height) // 2)
+        )
+        return background
+
+    def animation_indices() -> list[int]:
+        if not frames:
+            return []
+        row = max(0, min(GRID_ROWS - 1, int(direction_var.get()) - 1))
+        indices = [
+            index
+            for index in range(row * GRID_COLUMNS, (row + 1) * GRID_COLUMNS)
+            if index < len(frames)
+        ]
+        return indices or list(range(min(GRID_COLUMNS, len(frames))))
+
+    def show_animation_frame() -> None:
+        nonlocal animation_photo, animation_position
+        indices = animation_indices()
+        if not indices:
+            animation_label.configure(image="", text="Нет кадров")
+            return
+        animation_position %= len(indices)
+        image = checker_preview(frames[indices[animation_position]], 140)
+        animation_photo = ImageTk.PhotoImage(image)
+        animation_label.configure(image=animation_photo, text="")
+
+    def animation_tick() -> None:
+        nonlocal animation_position
+        if animation_running and frames:
+            show_animation_frame()
+            animation_position += 1
+        root.after(max(60, int(speed_var.get())), animation_tick)
+
+    def toggle_animation() -> None:
+        nonlocal animation_running
+        animation_running = not animation_running
+        play_button.configure(text="Пауза" if animation_running else "Старт")
+        if animation_running:
+            show_animation_frame()
+
+    play_button.configure(command=toggle_animation)
+
+    def select_cell(index: int) -> None:
+        nonlocal animation_position
+        if index >= len(frames):
+            return
+        direction_var.set(str(index // GRID_COLUMNS + 1))
+        animation_position = index % GRID_COLUMNS
+        show_animation_frame()
+        status_var.set(f"Выбран кадр {index:03d}, строка {index // GRID_COLUMNS + 1}.")
+
+    for index, label in enumerate(grid_labels):
+        label.bind("<Button-1>", lambda _event, selected=index: select_cell(selected))
+
+    def refresh_grid() -> None:
+        grid_photos.clear()
+        for index, label in enumerate(grid_labels):
+            if index < len(frames):
+                photo = ImageTk.PhotoImage(checker_preview(frames[index], 58))
+                grid_photos.append(photo)
+                label.configure(image=photo, text="", width=0)
+            else:
+                label.configure(image="", text=f"{index:02d}", width=7)
+        show_animation_frame()
+
+    def set_frames(new_frames: list[Image.Image], caption: str, stem: str) -> None:
+        nonlocal frames, animation_position, suggested_stem
+        frames = [frame.convert("RGBA") for frame in new_frames]
+        animation_position = 0
+        suggested_stem = stem or "sprites"
+        source_var.set(caption)
+        report = validate_frames(frames)
+        if report.errors:
+            status_var.set(f"Ошибок: {len(report.errors)}")
+        elif report.warnings:
+            status_var.set(report.warnings[0])
+        else:
+            status_var.set(
+                f"Готово: {report.frame_count} кадров {report.width}×{report.height}."
+            )
+        refresh_grid()
+
+    def report_text(report: FrameSetReport) -> str:
+        lines = [
+            f"Кадров: {report.frame_count}",
+            f"Размер: {report.width}×{report.height}" if report.width else "Размер: —",
+        ]
+        if report.errors:
+            lines.extend(["", "Ошибки:", *[f"• {message}" for message in report.errors]])
+        if report.warnings:
+            lines.extend(["", "Предупреждения:", *[f"• {message}" for message in report.warnings]])
+        if report.ok and not report.warnings:
+            lines.extend(["", "Ошибок не найдено."])
+        return "\n".join(lines)
+
+    def load_paths(paths: list[Path]) -> None:
+        png_paths = [path for path in paths if path.is_file() and path.suffix.lower() == ".png"]
+        directories = [path for path in paths if path.is_dir()]
+        if directories and not png_paths:
+            folder = directories[0]
+            try:
+                has_numbered_frames = any(
+                    path.is_file() and FRAME_NAME_RE.match(path.name)
+                    for path in folder.iterdir()
+                )
+                if has_numbered_frames:
+                    png_paths = find_frames(folder)
+                else:
+                    png_paths = [
+                        path
+                        for path in folder.glob("*.png")
+                        if path.name.lower() != "preview_sheet.png"
+                    ]
+                loaded = load_png_frames(png_paths)
+            except UgsError as exc:
+                messagebox.showerror("Ошибка PNG", str(exc))
+                return
+            remember(folder)
+            set_frames(loaded, f"Папка: {folder}", folder.name)
+            return
+        if not png_paths:
+            messagebox.showerror("Ошибка", "Перетащите PNG-файлы или папку с кадрами.")
+            return
+        if len(png_paths) == 1 and messagebox.askyesno(
+            "Импорт PNG", "Разделить этот PNG как спрайт-лист 8×8?"
+        ):
+            import_sheet_path(png_paths[0])
+            return
+        try:
+            loaded = load_png_frames(png_paths)
+        except UgsError as exc:
+            messagebox.showerror("Ошибка PNG", str(exc))
+            return
+        remember(png_paths[0])
+        set_frames(loaded, f"Перетащено PNG: {len(loaded)}", png_paths[0].stem)
+
+    def choose_png_files() -> None:
+        names = filedialog.askopenfilenames(
+            title="Выберите PNG-кадры",
+            initialdir=last_directory,
+            filetypes=[("PNG", "*.png")],
+        )
+        if names:
+            load_paths([Path(name) for name in names])
+
+    def choose_frame_folder() -> None:
+        name = filedialog.askdirectory(title="Выберите папку кадров", initialdir=last_directory)
+        if name:
+            load_paths([Path(name)])
+
+    def import_sheet_path(path: Path) -> None:
+        try:
+            loaded = split_sprite_sheet(path)
+        except UgsError as exc:
+            messagebox.showerror("Ошибка спрайт-листа", str(exc))
+            return
+        remember(path)
+        set_frames(loaded, f"Спрайт-лист: {path.name}", path.stem)
+
+    def import_sheet_clicked() -> None:
+        name = filedialog.askopenfilename(
+            title="Выберите спрайт-лист 8×8",
+            initialdir=last_directory,
+            filetypes=[("PNG", "*.png"), ("Все файлы", "*.*")],
+        )
+        if name:
+            import_sheet_path(Path(name))
+
+    def open_ugs_clicked() -> None:
+        source_name = filedialog.askopenfilename(
+            title="Открыть UGS",
+            initialdir=last_directory,
+            filetypes=[("UGS sprites", "*.ugs"), ("Все файлы", "*.*")],
+        )
+        if not source_name:
+            return
+        source = Path(source_name)
+        try:
+            loaded = read_ugs(source)
+        except UgsError as exc:
+            messagebox.showerror("UGS повреждён", str(exc))
+            return
+        remember(source)
+        set_frames(loaded, f"UGS: {source.name}", source.stem)
+        if not messagebox.askyesno("UGS открыт", "Сохранить распакованные PNG в папку?"):
+            return
+        output_name = filedialog.askdirectory(
+            title="Папка для PNG", initialdir=last_directory
+        )
+        if not output_name:
+            return
+        try:
+            count, size = extract_ugs(source, Path(output_name))
+        except UgsError as exc:
+            messagebox.showerror("Ошибка", str(exc))
+            return
+        status_var.set(f"Распаковано {count} кадров {size[0]}×{size[1]}.")
+
+    def validate_clicked() -> None:
+        report = validate_frames(frames)
+        messagebox.showerror("Найдены ошибки", report_text(report)) if report.errors else messagebox.showinfo(
+            "Проверка кадров", report_text(report)
+        )
+
+    def build_clicked() -> None:
+        nonlocal last_built_ugs
+        report = validate_frames(frames)
+        if report.errors:
+            messagebox.showerror("Нельзя собрать UGS", report_text(report))
+            return
+        if report.warnings and not messagebox.askyesno(
+            "Есть предупреждения", report_text(report) + "\n\nПродолжить сборку?"
+        ):
+            return
+        destination_name = filedialog.asksaveasfilename(
+            title="Сохранить UGS",
+            initialdir=last_directory,
+            initialfile=f"{suggested_stem}-new.ugs",
+            defaultextension=".ugs",
+            filetypes=[("UGS sprites", "*.ugs"), ("Все файлы", "*.*")],
+        )
+        if not destination_name:
+            return
+        destination = Path(destination_name)
+        backup: Path | None = None
+        if destination.exists() and not messagebox.askyesno(
+            "Подтверждение", f"Файл уже существует:\n{destination}\n\nЗаменить его?"
+        ):
+            return
+        try:
+            if destination.exists():
+                backup = create_backup(destination)
+            count, size = write_ugs(frames, destination, overwrite=True)
+        except UgsError as exc:
+            messagebox.showerror("Ошибка сборки", str(exc))
+            return
+        remember(destination)
+        last_built_ugs = destination
+        backup_line = f"\nРезервная копия: {backup}" if backup else ""
+        offer_to_open(
+            destination,
+            f"Собрано кадров: {count}\nРазмер: {size[0]}×{size[1]}\n"
+            f"Файл: {destination}{backup_line}",
+        )
+
+    def install_clicked() -> None:
+        source: Path | None = None
+        if last_built_ugs is not None and last_built_ugs.is_file():
+            if messagebox.askyesno(
+                "Установка", f"Использовать последний собранный файл?\n\n{last_built_ugs}"
+            ):
+                source = last_built_ugs
+        if source is None:
+            name = filedialog.askopenfilename(
+                title="Выберите новый UGS",
+                initialdir=last_directory,
+                filetypes=[("UGS sprites", "*.ugs")],
+            )
+            if not name:
+                return
+            source = Path(name)
+        target_name = filedialog.askopenfilename(
+            title="Выберите заменяемый UGS в папке игры",
+            initialdir=last_directory,
+            filetypes=[("UGS sprites", "*.ugs")],
+        )
+        if not target_name:
+            return
+        target = Path(target_name)
+        if not messagebox.askyesno(
+            "Подтвердите установку",
+            f"Новый файл:\n{source}\n\nФайл игры:\n{target}\n\n"
+            "Оригинал будет сохранён рядом как резервная копия. Продолжить?",
+        ):
+            return
+        try:
+            backup = install_ugs(source, target)
+        except UgsError as exc:
+            messagebox.showerror("Ошибка установки", str(exc))
+            return
+        remember(target)
+        messagebox.showinfo(
+            "Установка завершена",
+            f"Установлено:\n{target}\n\nРезервная копия:\n{backup}",
+        )
 
     def offer_to_open(path: Path, summary: str) -> None:
         if not messagebox.askyesno("Готово", summary + "\n\nОткрыть папку с результатом?"):
@@ -360,72 +881,6 @@ def run_gui() -> None:
             open_in_file_manager(path)
         except UgsError as exc:
             messagebox.showerror("Ошибка", str(exc))
-
-    def extract_clicked() -> None:
-        source_name = filedialog.askopenfilename(
-            title="Выберите UGS",
-            initialdir=last_directory,
-            filetypes=[("UGS sprites", "*.ugs"), ("Все файлы", "*.*")],
-        )
-        if not source_name:
-            return
-        source = Path(source_name)
-        remember(source)
-        output_name = filedialog.askdirectory(
-            title="Выберите папку для PNG",
-            initialdir=last_directory,
-        )
-        if not output_name:
-            return
-        output = Path(output_name)
-        remember(output)
-        try:
-            count, size = extract_ugs(source, output)
-        except UgsError as exc:
-            messagebox.showerror("Ошибка", str(exc))
-            return
-        offer_to_open(
-            output,
-            f"Распаковано кадров: {count}\nРазмер: {size[0]}×{size[1]}\n\n{output_name}",
-        )
-
-    def build_clicked() -> None:
-        input_name = filedialog.askdirectory(
-            title="Выберите папку с frame_*.png",
-            initialdir=last_directory,
-        )
-        if not input_name:
-            return
-        input_dir = Path(input_name)
-        remember(input_dir)
-        base_name = input_dir.name.removesuffix("_frames") or "sprites"
-        destination_name = filedialog.asksaveasfilename(
-            title="Сохранить UGS",
-            initialdir=input_dir.parent,
-            initialfile=f"{base_name}-new.ugs",
-            defaultextension=".ugs",
-            filetypes=[("UGS sprites", "*.ugs"), ("Все файлы", "*.*")],
-        )
-        if not destination_name:
-            return
-        destination = Path(destination_name)
-        remember(destination)
-        backup: Path | None = None
-        if destination.exists() and not messagebox.askyesno("Подтверждение", f"Файл уже существует:\n{destination}\n\nЗаменить его?"):
-            return
-        try:
-            if destination.exists():
-                backup = create_backup(destination)
-            count, size = build_ugs(input_dir, destination, overwrite=True)
-        except UgsError as exc:
-            messagebox.showerror("Ошибка", str(exc))
-            return
-        backup_line = f"\nРезервная копия: {backup}" if backup else ""
-        offer_to_open(
-            destination,
-            f"Собрано кадров: {count}\nРазмер: {size[0]}×{size[1]}\n"
-            f"Файл: {destination}{backup_line}",
-        )
 
     def inspect_clicked() -> None:
         source_name = filedialog.askopenfilename(
@@ -450,12 +905,45 @@ def run_gui() -> None:
             f"SHA-256: {details.sha256}",
         )
 
-    buttons = tk.Frame(root)
-    buttons.pack()
-    tk.Button(buttons, text="Распаковать UGS → PNG", width=24, height=2, command=extract_clicked).grid(row=0, column=0, padx=8)
-    tk.Button(buttons, text="Собрать PNG → UGS", width=24, height=2, command=build_clicked).grid(row=0, column=1, padx=8)
-    tk.Button(root, text="Проверить UGS", width=24, command=inspect_clicked).pack(pady=(14, 0))
-    tk.Label(root, text="PNG должны называться frame_000.png, frame_001.png…", fg="#555555").pack(pady=14)
+    actions = ttk.LabelFrame(controls, text="Действия", padding=8)
+    actions.pack(fill="x")
+    action_items = (
+        ("Открыть / распаковать UGS", open_ugs_clicked),
+        ("Выбрать папку PNG", choose_frame_folder),
+        ("Выбрать PNG-файлы", choose_png_files),
+        ("Импортировать спрайт-лист 8×8", import_sheet_clicked),
+        ("Проверить загруженные кадры", validate_clicked),
+        ("Собрать UGS", build_clicked),
+        ("Проверить отдельный UGS", inspect_clicked),
+        ("Установить UGS в игру", install_clicked),
+    )
+    actions.columnconfigure(0, weight=1)
+    actions.columnconfigure(1, weight=1)
+    for index, (text, command) in enumerate(action_items):
+        ttk.Button(actions, text=text, command=command).grid(
+            row=index // 2,
+            column=index % 2,
+            sticky="ew",
+            padx=(0, 3) if index % 2 == 0 else (3, 0),
+            pady=2,
+        )
+
+    if DND_FILES is not None:
+        def on_drop(event: object) -> None:
+            raw = getattr(event, "data", "")
+            dropped = [Path(item) for item in root.tk.splitlist(raw)]
+            load_paths(dropped)
+
+        root.drop_target_register(DND_FILES)
+        root.dnd_bind("<<Drop>>", on_drop)
+
+    def direction_changed(_event: object) -> None:
+        nonlocal animation_position
+        animation_position = 0
+        show_animation_frame()
+
+    direction_combo.bind("<<ComboboxSelected>>", direction_changed)
+    root.after(100, animation_tick)
     root.mainloop()
 
 
@@ -474,6 +962,13 @@ def create_parser() -> argparse.ArgumentParser:
 
     inspect_parser = subparsers.add_parser("inspect", help="проверить UGS и показать сведения")
     inspect_parser.add_argument("source", type=Path, help="проверяемый .ugs")
+
+    install_parser = subparsers.add_parser("install", help="установить UGS поверх файла игры")
+    install_parser.add_argument("source", type=Path, help="новый .ugs")
+    install_parser.add_argument("target", type=Path, help="заменяемый .ugs в папке игры")
+    install_parser.add_argument(
+        "--yes", action="store_true", help="подтвердить замену и создание резервной копии"
+    )
     return parser
 
 
@@ -501,6 +996,11 @@ def main(argv: list[str] | None = None) -> int:
                 f"{details.width}x{details.height}, {details.file_size} байт\n"
                 f"SHA-256: {details.sha256}"
             )
+        elif args.command == "install":
+            if not args.yes:
+                raise UgsError("Для установки добавьте --yes после проверки выбранных путей.")
+            backup = install_ugs(args.source, args.target)
+            print(f"Готово: установлен {args.target}\nРезервная копия: {backup}")
     except UgsError as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1

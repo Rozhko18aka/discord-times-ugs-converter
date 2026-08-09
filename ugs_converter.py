@@ -66,6 +66,15 @@ class FrameSetReport:
         return not self.errors
 
 
+def calculate_window_size(screen_width: int, screen_height: int) -> tuple[int, int]:
+    """Choose a useful window size without exceeding the current screen."""
+    if screen_width <= 0 or screen_height <= 0:
+        raise ValueError("Screen dimensions must be positive")
+    width = min(screen_width, max(720, min(1100, int(screen_width * 0.88))))
+    height = min(screen_height, max(500, min(760, int(screen_height * 0.82))))
+    return width, height
+
+
 def rotate_left_16(value: int, count: int) -> int:
     count %= 16
     return ((value << count) | (value >> (16 - count))) & 0xFFFF
@@ -534,8 +543,13 @@ def run_gui() -> None:
 
     root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
     root.title("Discord Times — UGS Converter")
-    root.geometry("1100x690")
-    root.minsize(1020, 640)
+    screen_width = root.winfo_screenwidth()
+    screen_height = root.winfo_screenheight()
+    window_width, window_height = calculate_window_size(screen_width, screen_height)
+    window_x = max(0, (screen_width - window_width) // 2)
+    window_y = max(0, (screen_height - window_height) // 3)
+    root.geometry(f"{window_width}x{window_height}+{window_x}+{window_y}")
+    root.minsize(min(900, window_width), min(520, window_height))
     last_directory = Path.cwd()
     frames: list[Image.Image] = []
     grid_photos: list[ImageTk.PhotoImage] = []
@@ -545,11 +559,52 @@ def run_gui() -> None:
     animation_running = True
     last_built_ugs: Path | None = None
     suggested_stem = "sprites"
+    grid_cell_size = 58
+    grid_resize_job: str | None = None
+    animation_preview_size = max(96, min(140, window_height // 5))
 
     outer = ttk.Frame(root, padding=12)
     outer.pack(fill="both", expand=True)
-    controls = ttk.Frame(outer, width=350)
-    controls.pack(side="left", fill="y", padx=(0, 14))
+    controls_width = min(360, max(300, window_width // 3))
+    controls_shell = ttk.Frame(outer, width=controls_width)
+    controls_shell.pack(side="left", fill="y", padx=(0, 14))
+    controls_shell.pack_propagate(False)
+    controls_canvas = tk.Canvas(
+        controls_shell,
+        width=controls_width,
+        highlightthickness=0,
+        borderwidth=0,
+        background=root.cget("background"),
+    )
+    controls_scrollbar = ttk.Scrollbar(
+        controls_shell, orient="vertical", command=controls_canvas.yview
+    )
+    controls_canvas.configure(yscrollcommand=controls_scrollbar.set)
+    controls_scrollbar.pack(side="right", fill="y")
+    controls_canvas.pack(side="left", fill="both", expand=True)
+    controls = ttk.Frame(controls_canvas)
+    controls_window = controls_canvas.create_window((0, 0), window=controls, anchor="nw")
+
+    def update_controls_scrollregion(_event: object | None = None) -> None:
+        controls_canvas.configure(scrollregion=controls_canvas.bbox("all"))
+
+    def resize_controls(event: object) -> None:
+        width = int(getattr(event, "width", controls_width))
+        controls_canvas.itemconfigure(controls_window, width=width)
+
+    controls.bind("<Configure>", update_controls_scrollregion)
+    controls_canvas.bind("<Configure>", resize_controls)
+    def scroll_controls(event: object) -> None:
+        delta = int(getattr(event, "delta", 0))
+        if delta:
+            controls_canvas.yview_scroll(-1 if delta > 0 else 1, "units")
+
+    controls_shell.bind(
+        "<Enter>", lambda _event: root.bind_all("<MouseWheel>", scroll_controls)
+    )
+    controls_shell.bind(
+        "<Leave>", lambda _event: root.unbind_all("<MouseWheel>")
+    )
     preview = ttk.Frame(outer)
     preview.pack(side="left", fill="both", expand=True)
 
@@ -559,7 +614,7 @@ def run_gui() -> None:
     ttk.Label(
         controls,
         text="Загрузите 64 PNG, папку кадров, UGS или спрайт-лист 8×8.",
-        wraplength=330,
+        wraplength=controls_width - 35,
         justify="left",
     ).pack(anchor="w", pady=(0, 12))
 
@@ -576,15 +631,22 @@ def run_gui() -> None:
 
     source_box = ttk.LabelFrame(controls, text="Текущий набор", padding=8)
     source_box.pack(fill="x", pady=(0, 10))
-    ttk.Label(source_box, textvariable=source_var, wraplength=320).pack(anchor="w")
-    ttk.Label(source_box, textvariable=status_var, wraplength=320, foreground="#555555").pack(
+    ttk.Label(
+        source_box, textvariable=source_var, wraplength=controls_width - 50
+    ).pack(anchor="w")
+    ttk.Label(
+        source_box,
+        textvariable=status_var,
+        wraplength=controls_width - 50,
+        foreground="#555555",
+    ).pack(
         anchor="w", pady=(4, 0)
     )
 
     grid_box = ttk.LabelFrame(preview, text="Сетка кадров 8×8", padding=8)
     grid_box.pack(fill="both", expand=True)
     grid_frame = ttk.Frame(grid_box)
-    grid_frame.pack(anchor="center")
+    grid_frame.pack(anchor="center", expand=True)
     grid_labels: list[ttk.Label] = []
     for index in range(UNIT_FRAME_COUNT):
         label = ttk.Label(
@@ -658,7 +720,9 @@ def run_gui() -> None:
             animation_label.configure(image="", text="Нет кадров")
             return
         animation_position %= len(indices)
-        image = checker_preview(frames[indices[animation_position]], 140)
+        image = checker_preview(
+            frames[indices[animation_position]], animation_preview_size
+        )
         animation_photo = ImageTk.PhotoImage(image)
         animation_label.configure(image=animation_photo, text="")
 
@@ -704,13 +768,38 @@ def run_gui() -> None:
         grid_photos.clear()
         for index, label in enumerate(grid_labels):
             if index < len(frames):
-                photo = ImageTk.PhotoImage(checker_preview(frames[index], 58))
+                photo = ImageTk.PhotoImage(
+                    checker_preview(frames[index], grid_cell_size)
+                )
                 grid_photos.append(photo)
                 label.configure(image=photo, text="", width=0)
             else:
                 label.configure(image="", text=f"{index:02d}", width=7)
         refresh_selection()
         show_animation_frame()
+
+    def apply_grid_size(new_size: int) -> None:
+        nonlocal grid_cell_size, grid_resize_job
+        grid_resize_job = None
+        if new_size == grid_cell_size:
+            return
+        grid_cell_size = new_size
+        if frames:
+            refresh_grid()
+
+    def schedule_grid_resize(event: object) -> None:
+        nonlocal grid_resize_job
+        width = int(getattr(event, "width", 600))
+        height = int(getattr(event, "height", 600))
+        available = min((width - 36) // GRID_COLUMNS, (height - 42) // GRID_ROWS)
+        new_size = max(30, min(72, available - 6))
+        if abs(new_size - grid_cell_size) < 2:
+            return
+        if grid_resize_job is not None:
+            root.after_cancel(grid_resize_job)
+        grid_resize_job = root.after(120, lambda: apply_grid_size(new_size))
+
+    grid_box.bind("<Configure>", schedule_grid_resize)
 
     def set_frames(new_frames: list[Image.Image], caption: str, stem: str) -> None:
         nonlocal frames, animation_position, selected_frame_index, suggested_stem

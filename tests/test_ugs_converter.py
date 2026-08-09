@@ -8,6 +8,7 @@ from PIL import Image
 from ugs_converter import (
     UgsError,
     build_ugs,
+    calculate_window_size,
     create_backup,
     decode_ugs_pixel,
     encode_ugs_pixel,
@@ -37,6 +38,16 @@ class PixelFormatTests(unittest.TestCase):
     def test_rotations_are_inverse(self) -> None:
         for value in (0x0000, 0x0001, 0x1234, 0xAAAA, 0xFFFF):
             self.assertEqual(rotate_right_16(rotate_left_16(value, 3), 3), value)
+
+
+class InterfaceSizingTests(unittest.TestCase):
+    def test_window_size_adapts_to_common_scaled_desktops(self) -> None:
+        self.assertEqual(calculate_window_size(1280, 720), (1100, 590))
+        self.assertEqual(calculate_window_size(1920, 1080), (1100, 760))
+        self.assertEqual(calculate_window_size(800, 600), (720, 500))
+
+    def test_window_never_exceeds_small_screen(self) -> None:
+        self.assertEqual(calculate_window_size(640, 480), (640, 480))
 
 
 class ContainerRoundTripTests(unittest.TestCase):

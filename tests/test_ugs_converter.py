@@ -5,9 +5,11 @@ from pathlib import Path
 
 from ugs_converter import (
     build_ugs,
+    create_backup,
     decode_ugs_pixel,
     encode_ugs_pixel,
     extract_ugs,
+    inspect_ugs,
     read_ugs,
     rotate_left_16,
     rotate_right_16,
@@ -47,9 +49,27 @@ class ContainerRoundTripTests(unittest.TestCase):
             self.assertEqual(len(decoded), 1)
             self.assertEqual(decoded[0].size, (2, 1))
 
+            details = inspect_ugs(source)
+            self.assertEqual(details.frame_count, 1)
+            self.assertEqual((details.width, details.height), (2, 1))
+            self.assertEqual(details.file_size, len(original))
+
             extract_ugs(source, frames)
             build_ugs(frames, rebuilt)
             self.assertEqual(rebuilt.read_bytes(), original)
+
+    def test_backup_keeps_original_and_uses_free_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "hero.ugs"
+            source.write_bytes(b"original")
+
+            first = create_backup(source)
+            second = create_backup(source)
+
+            self.assertEqual(first.name, "hero.ugs.bak")
+            self.assertEqual(second.name, "hero.ugs.bak.1")
+            self.assertEqual(first.read_bytes(), b"original")
+            self.assertEqual(second.read_bytes(), b"original")
 
 
 if __name__ == "__main__":

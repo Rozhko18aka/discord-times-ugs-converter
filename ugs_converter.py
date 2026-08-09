@@ -12,13 +12,16 @@ ROL16(ARGB4444, 3) XOR 0xAAAA. Fully transparent black therefore becomes
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
+import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 
@@ -36,6 +39,15 @@ FRAME_NAME_RE = re.compile(r"^frame_(\d+)\.png$", re.IGNORECASE)
 
 class UgsError(Exception):
     """A user-facing validation error."""
+
+
+@dataclass(frozen=True)
+class UgsInfo:
+    frame_count: int
+    width: int
+    height: int
+    file_size: int
+    sha256: str
 
 
 def rotate_left_16(value: int, count: int) -> int:
@@ -109,6 +121,53 @@ def read_ugs(path: Path) -> list[Image.Image]:
         offset = record_end
 
     return frames
+
+
+def inspect_ugs(path: Path) -> UgsInfo:
+    """Validate a UGS file and return a compact summary."""
+    frames = read_ugs(path)
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise UgsError(f"Не удалось прочитать файл: {exc}") from exc
+    return UgsInfo(
+        frame_count=len(frames),
+        width=frames[0].width,
+        height=frames[0].height,
+        file_size=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
+    )
+
+
+def create_backup(path: Path) -> Path:
+    """Copy an existing file to the first available numbered .bak path."""
+    if not path.is_file():
+        raise UgsError(f"Нечего сохранять в резервную копию: {path}")
+
+    candidate = path.with_name(path.name + ".bak")
+    number = 1
+    while candidate.exists():
+        candidate = path.with_name(f"{path.name}.bak.{number}")
+        number += 1
+    try:
+        shutil.copy2(path, candidate)
+    except OSError as exc:
+        raise UgsError(f"Не удалось создать резервную копию: {exc}") from exc
+    return candidate
+
+
+def open_in_file_manager(path: Path) -> None:
+    """Open a directory (or select a file) using the platform file manager."""
+    target = path if path.is_dir() else path.parent
+    try:
+        if sys.platform == "win32":
+            os.startfile(str(target))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(target)])
+        else:
+            subprocess.Popen(["xdg-open", str(target)])
+    except OSError as exc:
+        raise UgsError(f"Не удалось открыть папку: {exc}") from exc
 
 
 def make_preview(frames: list[Image.Image], columns: int = 8) -> Image.Image:
@@ -273,8 +332,9 @@ def run_gui() -> None:
 
     root = tk.Tk()
     root.title("Discord Times — UGS Converter")
-    root.geometry("520x245")
+    root.geometry("560x315")
     root.resizable(False, False)
+    last_directory = Path.cwd()
 
     title = tk.Label(root, text="Конвертер спрайтов UGS", font=("Segoe UI", 16, "bold"))
     title.pack(pady=(22, 8))
@@ -289,49 +349,113 @@ def run_gui() -> None:
     )
     info.pack(pady=(0, 20))
 
-    def extract_clicked() -> None:
-        source_name = filedialog.askopenfilename(title="Выберите UGS", filetypes=[("UGS sprites", "*.ugs"), ("Все файлы", "*.*")])
-        if not source_name:
-            return
-        output_name = filedialog.askdirectory(title="Выберите папку для PNG")
-        if not output_name:
+    def remember(path: Path) -> None:
+        nonlocal last_directory
+        last_directory = path if path.is_dir() else path.parent
+
+    def offer_to_open(path: Path, summary: str) -> None:
+        if not messagebox.askyesno("Готово", summary + "\n\nОткрыть папку с результатом?"):
             return
         try:
-            count, size = extract_ugs(Path(source_name), Path(output_name))
+            open_in_file_manager(path)
+        except UgsError as exc:
+            messagebox.showerror("Ошибка", str(exc))
+
+    def extract_clicked() -> None:
+        source_name = filedialog.askopenfilename(
+            title="Выберите UGS",
+            initialdir=last_directory,
+            filetypes=[("UGS sprites", "*.ugs"), ("Все файлы", "*.*")],
+        )
+        if not source_name:
+            return
+        source = Path(source_name)
+        remember(source)
+        output_name = filedialog.askdirectory(
+            title="Выберите папку для PNG",
+            initialdir=last_directory,
+        )
+        if not output_name:
+            return
+        output = Path(output_name)
+        remember(output)
+        try:
+            count, size = extract_ugs(source, output)
         except UgsError as exc:
             messagebox.showerror("Ошибка", str(exc))
             return
-        messagebox.showinfo("Готово", f"Распаковано кадров: {count}\nРазмер: {size[0]}×{size[1]}\n\n{output_name}")
+        offer_to_open(
+            output,
+            f"Распаковано кадров: {count}\nРазмер: {size[0]}×{size[1]}\n\n{output_name}",
+        )
 
     def build_clicked() -> None:
-        input_name = filedialog.askdirectory(title="Выберите папку с frame_*.png")
+        input_name = filedialog.askdirectory(
+            title="Выберите папку с frame_*.png",
+            initialdir=last_directory,
+        )
         if not input_name:
             return
+        input_dir = Path(input_name)
+        remember(input_dir)
+        base_name = input_dir.name.removesuffix("_frames") or "sprites"
         destination_name = filedialog.asksaveasfilename(
             title="Сохранить UGS",
+            initialdir=input_dir.parent,
+            initialfile=f"{base_name}-new.ugs",
             defaultextension=".ugs",
             filetypes=[("UGS sprites", "*.ugs"), ("Все файлы", "*.*")],
         )
         if not destination_name:
             return
         destination = Path(destination_name)
+        remember(destination)
+        backup: Path | None = None
         if destination.exists() and not messagebox.askyesno("Подтверждение", f"Файл уже существует:\n{destination}\n\nЗаменить его?"):
             return
         try:
-            count, size = build_ugs(Path(input_name), destination, overwrite=True)
+            if destination.exists():
+                backup = create_backup(destination)
+            count, size = build_ugs(input_dir, destination, overwrite=True)
         except UgsError as exc:
             messagebox.showerror("Ошибка", str(exc))
             return
+        backup_line = f"\nРезервная копия: {backup}" if backup else ""
+        offer_to_open(
+            destination,
+            f"Собрано кадров: {count}\nРазмер: {size[0]}×{size[1]}\n"
+            f"Файл: {destination}{backup_line}",
+        )
+
+    def inspect_clicked() -> None:
+        source_name = filedialog.askopenfilename(
+            title="Проверить UGS",
+            initialdir=last_directory,
+            filetypes=[("UGS sprites", "*.ugs"), ("Все файлы", "*.*")],
+        )
+        if not source_name:
+            return
+        source = Path(source_name)
+        remember(source)
+        try:
+            details = inspect_ugs(source)
+        except UgsError as exc:
+            messagebox.showerror("UGS повреждён", str(exc))
+            return
         messagebox.showinfo(
-            "Готово",
-            f"Собрано кадров: {count}\nРазмер: {size[0]}×{size[1]}\nФайл: {destination}",
+            "UGS исправен",
+            f"Кадров: {details.frame_count}\n"
+            f"Размер кадра: {details.width}×{details.height}\n"
+            f"Размер файла: {details.file_size:,} байт\n"
+            f"SHA-256: {details.sha256}",
         )
 
     buttons = tk.Frame(root)
     buttons.pack()
     tk.Button(buttons, text="Распаковать UGS → PNG", width=24, height=2, command=extract_clicked).grid(row=0, column=0, padx=8)
     tk.Button(buttons, text="Собрать PNG → UGS", width=24, height=2, command=build_clicked).grid(row=0, column=1, padx=8)
-    tk.Label(root, text="PNG должны называться frame_000.png, frame_001.png…", fg="#555555").pack(pady=18)
+    tk.Button(root, text="Проверить UGS", width=24, command=inspect_clicked).pack(pady=(14, 0))
+    tk.Label(root, text="PNG должны называться frame_000.png, frame_001.png…", fg="#555555").pack(pady=14)
     root.mainloop()
 
 
@@ -347,6 +471,9 @@ def create_parser() -> argparse.ArgumentParser:
     build_parser.add_argument("input_dir", type=Path, help="папка с PNG")
     build_parser.add_argument("destination", type=Path, help="выходной .ugs")
     build_parser.add_argument("--force", action="store_true", help="разрешить замену существующего файла")
+
+    inspect_parser = subparsers.add_parser("inspect", help="проверить UGS и показать сведения")
+    inspect_parser.add_argument("source", type=Path, help="проверяемый .ugs")
     return parser
 
 
@@ -367,6 +494,13 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "build":
             count, size = build_ugs(args.input_dir, args.destination, args.force)
             print(f"Готово: собрано {count} кадров {size[0]}x{size[1]} в {args.destination}")
+        elif args.command == "inspect":
+            details = inspect_ugs(args.source)
+            print(
+                f"UGS исправен: {details.frame_count} кадров "
+                f"{details.width}x{details.height}, {details.file_size} байт\n"
+                f"SHA-256: {details.sha256}"
+            )
     except UgsError as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1

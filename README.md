@@ -11,6 +11,8 @@
 - проверка размеров и последовательности кадров;
 - графическое окно и интерфейс командной строки;
 - защита от случайной замены существующего файла.
+- проверка UGS без распаковки;
+- резервная копия заменяемого UGS и быстрое открытие папки результата.
 
 ## Быстрый запуск в Windows
 
@@ -34,6 +36,7 @@
 ```powershell
 python ugs_converter.py extract "Hero-Knight.ugs" ".\hero_frames"
 python ugs_converter.py build ".\hero_frames" ".\Hero-Knight-new.ugs"
+python ugs_converter.py inspect "Hero-Knight.ugs"
 ```
 
 Добавьте `--force`, если разрешено заменить существующий выходной UGS.

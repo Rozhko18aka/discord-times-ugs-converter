@@ -237,7 +237,7 @@ def open_in_file_manager(path: Path) -> None:
 
 
 def validate_frames(
-    frames: list[Image.Image], expected_count: int = UNIT_FRAME_COUNT
+    frames: list[Image.Image], expected_count: int | None = None
 ) -> FrameSetReport:
     """Collect all useful frame errors and non-blocking compatibility warnings."""
     if not frames:
@@ -259,7 +259,7 @@ def validate_frames(
         suffix = "…" if len(wrong_sizes) > 10 else ""
         errors.append(f"Кадры другого размера: {shown}{suffix}.")
 
-    if len(frames) != expected_count:
+    if expected_count is not None and len(frames) != expected_count:
         warnings.append(
             f"Для сетки 8×8 ожидается {expected_count} кадров, загружено {len(frames)}."
         )
@@ -327,7 +327,13 @@ def split_sprite_sheet(
     ]
 
 
-def make_preview(frames: list[Image.Image], columns: int = 8) -> Image.Image:
+def make_preview(frames: list[Image.Image], columns: int | None = None) -> Image.Image:
+    if not frames:
+        raise UgsError("Невозможно создать предпросмотр без кадров.")
+    if columns is None:
+        columns = min(GRID_COLUMNS, len(frames))
+    if columns <= 0:
+        raise UgsError("Количество столбцов предпросмотра должно быть положительным.")
     width, height = frames[0].size
     rows = math.ceil(len(frames) / columns)
     preview = Image.new("RGBA", (columns * width, rows * height), (36, 36, 36, 255))
@@ -559,6 +565,7 @@ def run_gui() -> None:
     animation_running = True
     last_built_ugs: Path | None = None
     suggested_stem = "sprites"
+    workspace_expected_count: int | None = UNIT_FRAME_COUNT
     grid_cell_size = 58
     grid_resize_job: str | None = None
     animation_preview_size = max(96, min(140, window_height // 5))
@@ -613,7 +620,7 @@ def run_gui() -> None:
     )
     ttk.Label(
         controls,
-        text="Загрузите 64 PNG, папку кадров, UGS или спрайт-лист 8×8.",
+        text="Загрузите UGS, папку кадров, отдельные PNG или спрайт-лист 8×8.",
         wraplength=controls_width - 35,
         justify="left",
     ).pack(anchor="w", pady=(0, 12))
@@ -801,14 +808,21 @@ def run_gui() -> None:
 
     grid_box.bind("<Configure>", schedule_grid_resize)
 
-    def set_frames(new_frames: list[Image.Image], caption: str, stem: str) -> None:
-        nonlocal frames, animation_position, selected_frame_index, suggested_stem
+    def set_frames(
+        new_frames: list[Image.Image],
+        caption: str,
+        stem: str,
+        expected_count: int | None = UNIT_FRAME_COUNT,
+    ) -> None:
+        nonlocal frames, animation_position, selected_frame_index
+        nonlocal suggested_stem, workspace_expected_count
         frames = [frame.convert("RGBA") for frame in new_frames]
         animation_position = 0
         selected_frame_index = 0
         suggested_stem = stem or "sprites"
+        workspace_expected_count = expected_count
         source_var.set(caption)
-        report = validate_frames(frames)
+        report = validate_frames(frames, workspace_expected_count)
         if report.errors:
             status_var.set(f"Ошибок: {len(report.errors)}")
         elif report.warnings:
@@ -833,8 +847,15 @@ def run_gui() -> None:
         return "\n".join(lines)
 
     def load_paths(paths: list[Path]) -> None:
+        ugs_paths = [path for path in paths if path.is_file() and path.suffix.lower() == ".ugs"]
         png_paths = [path for path in paths if path.is_file() and path.suffix.lower() == ".png"]
         directories = [path for path in paths if path.is_dir()]
+        if ugs_paths:
+            if len(ugs_paths) != 1 or png_paths or directories:
+                messagebox.showerror("Открытие UGS", "Перетащите один UGS-файл за раз.")
+                return
+            load_ugs_path(ugs_paths[0], offer_export=False)
+            return
         if directories and not png_paths:
             folder = directories[0]
             try:
@@ -905,23 +926,22 @@ def run_gui() -> None:
         if name:
             import_sheet_path(Path(name))
 
-    def open_ugs_clicked() -> None:
-        source_name = filedialog.askopenfilename(
-            title="Открыть UGS",
-            initialdir=last_directory,
-            filetypes=[("UGS sprites", "*.ugs"), ("Все файлы", "*.*")],
-        )
-        if not source_name:
-            return
-        source = Path(source_name)
+    def load_ugs_path(source: Path, offer_export: bool) -> None:
         try:
             loaded = read_ugs(source)
         except UgsError as exc:
             messagebox.showerror("UGS повреждён", str(exc))
             return
         remember(source)
-        set_frames(loaded, f"UGS: {source.name}", source.stem)
-        if not messagebox.askyesno("UGS открыт", "Сохранить распакованные PNG в папку?"):
+        set_frames(
+            loaded,
+            f"UGS: {source.name}",
+            source.stem,
+            expected_count=None,
+        )
+        if not offer_export or not messagebox.askyesno(
+            "UGS открыт", "Сохранить распакованные PNG в папку?"
+        ):
             return
         output_name = filedialog.askdirectory(
             title="Папка для PNG", initialdir=last_directory
@@ -935,15 +955,24 @@ def run_gui() -> None:
             return
         status_var.set(f"Распаковано {count} кадров {size[0]}×{size[1]}.")
 
+    def open_ugs_clicked() -> None:
+        source_name = filedialog.askopenfilename(
+            title="Открыть UGS",
+            initialdir=last_directory,
+            filetypes=[("UGS sprites", "*.ugs"), ("Все файлы", "*.*")],
+        )
+        if source_name:
+            load_ugs_path(Path(source_name), offer_export=True)
+
     def validate_clicked() -> None:
-        report = validate_frames(frames)
+        report = validate_frames(frames, workspace_expected_count)
         messagebox.showerror("Найдены ошибки", report_text(report)) if report.errors else messagebox.showinfo(
             "Проверка кадров", report_text(report)
         )
 
     def build_clicked() -> None:
         nonlocal last_built_ugs
-        report = validate_frames(frames)
+        report = validate_frames(frames, workspace_expected_count)
         if report.errors:
             messagebox.showerror("Нельзя собрать UGS", report_text(report))
             return
@@ -1092,7 +1121,7 @@ def run_gui() -> None:
         if not frames:
             messagebox.showerror("Экспорт", "Сначала загрузите кадры.")
             return
-        report = validate_frames(frames)
+        report = validate_frames(frames, expected_count=UNIT_FRAME_COUNT)
         if report.errors:
             messagebox.showerror("Нельзя создать лист", report_text(report))
             return

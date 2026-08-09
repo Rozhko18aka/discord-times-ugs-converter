@@ -16,6 +16,7 @@ from ugs_converter import (
     extract_ugs,
     inspect_ugs,
     install_ugs,
+    make_preview,
     make_sprite_sheet,
     read_ugs,
     rotate_left_16,
@@ -145,11 +146,40 @@ class ContainerRoundTripTests(unittest.TestCase):
 
     def test_validation_collects_size_error_and_count_warning(self) -> None:
         report = validate_frames(
-            [Image.new("RGBA", (64, 64)), Image.new("RGBA", (32, 64))]
+            [Image.new("RGBA", (64, 64)), Image.new("RGBA", (32, 64))],
+            expected_count=64,
         )
         self.assertFalse(report.ok)
         self.assertEqual(len(report.errors), 1)
         self.assertEqual(len(report.warnings), 1)
+
+    def test_non_unit_frame_counts_are_valid_without_unit_expectation(self) -> None:
+        for count in (1, 8, 50):
+            frames = [Image.new("RGBA", (4, 3)) for _ in range(count)]
+            report = validate_frames(frames)
+            self.assertTrue(report.ok)
+            self.assertEqual(report.warnings, ())
+
+    def test_preview_uses_only_needed_columns(self) -> None:
+        wide = Image.new("RGBA", (896, 128))
+        self.assertEqual(make_preview([wide]).size, (896, 128))
+        arrows = [Image.new("RGBA", (32, 22)) for _ in range(8)]
+        self.assertEqual(make_preview(arrows).size, (256, 22))
+
+    def test_non_unit_ugs_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for count, size in ((1, (12, 7)), (8, (4, 3)), (50, (2, 2))):
+                frames = [
+                    Image.new("RGBA", size, ((index % 16) * 17, 34, 51, 255))
+                    for index in range(count)
+                ]
+                source = root / f"source-{count}.ugs"
+                rebuilt = root / f"rebuilt-{count}.ugs"
+                write_ugs(frames, source)
+                decoded = read_ugs(source)
+                write_ugs(decoded, rebuilt)
+                self.assertEqual(rebuilt.read_bytes(), source.read_bytes())
 
     def test_install_replaces_target_and_preserves_backup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

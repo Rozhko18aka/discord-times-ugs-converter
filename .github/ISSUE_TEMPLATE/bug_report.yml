@@ -1,0 +1,35 @@
+name: Сообщить об ошибке
+description: Расскажите о проблеме с распаковкой, сборкой или интерфейсом
+title: "[Ошибка]: "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Что произошло?
+      description: Опишите ожидаемый и фактический результат.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Версия Python
+      placeholder: Например, Python 3.11.9
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Способ запуска
+      options:
+        - Графическое окно
+        - Командная строка
+    validations:
+      required: true
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Дополнительные сведения
+      description: Приложите текст ошибки и шаги для её повторения. Не загружайте игровые файлы, если у вас нет права их распространять.

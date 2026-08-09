@@ -6,3 +6,12 @@
 !/ugs_converter.py
 !/launch_converter.bat
 !/Запустить UGS Converter.bat
+!/LICENSE
+!/CHANGELOG.md
+!/tests/
+!/tests/test_ugs_converter.py
+!/.github/
+!/.github/workflows/
+!/.github/workflows/tests.yml
+!/.github/ISSUE_TEMPLATE/
+!/.github/ISSUE_TEMPLATE/bug_report.yml

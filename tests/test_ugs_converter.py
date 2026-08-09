@@ -11,9 +11,11 @@ from ugs_converter import (
     create_backup,
     decode_ugs_pixel,
     encode_ugs_pixel,
+    export_png_frames,
     extract_ugs,
     inspect_ugs,
     install_ugs,
+    make_sprite_sheet,
     read_ugs,
     rotate_left_16,
     rotate_right_16,
@@ -97,6 +99,38 @@ class ContainerRoundTripTests(unittest.TestCase):
         self.assertTrue(all(frame.size == (2, 2) for frame in frames))
         self.assertEqual(frames[0].getpixel((0, 0)), (0, 255, 0, 255))
         self.assertEqual(frames[63].getpixel((0, 0)), (63, 192, 31, 255))
+
+    def test_sprite_sheet_export_round_trips_all_frames(self) -> None:
+        original = [
+            Image.new("RGBA", (2, 3), (index, 255 - index, index // 2, 255))
+            for index in range(64)
+        ]
+        sheet = make_sprite_sheet(original)
+        self.assertEqual(sheet.size, (16, 24))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "sheet.png"
+            sheet.save(source)
+            restored = split_sprite_sheet(source)
+
+        self.assertEqual(
+            [frame.getpixel((0, 0)) for frame in restored],
+            [frame.getpixel((0, 0)) for frame in original],
+        )
+
+    def test_export_all_frames_uses_stable_names_and_guards_overwrite(self) -> None:
+        original = [Image.new("RGBA", (2, 2), (index, 0, 0, 255)) for index in range(3)]
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            exported = export_png_frames(original, output)
+
+            self.assertEqual(
+                [path.name for path in exported],
+                ["frame_000.png", "frame_001.png", "frame_002.png"],
+            )
+            self.assertEqual(Image.open(exported[2]).convert("RGBA").getpixel((0, 0)), (2, 0, 0, 255))
+            with self.assertRaises(UgsError):
+                export_png_frames(original, output)
 
     def test_validation_collects_size_error_and_count_warning(self) -> None:
         report = validate_frames(

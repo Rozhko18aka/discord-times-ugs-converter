@@ -336,6 +336,53 @@ def make_preview(frames: list[Image.Image], columns: int = 8) -> Image.Image:
     return preview
 
 
+def make_sprite_sheet(
+    frames: list[Image.Image], columns: int = GRID_COLUMNS, rows: int = GRID_ROWS
+) -> Image.Image:
+    """Combine frames into a transparent, tightly packed sprite sheet."""
+    report = validate_frames(frames, expected_count=columns * rows)
+    if report.errors:
+        raise UgsError("\n".join(report.errors))
+    capacity = columns * rows
+    if len(frames) > capacity:
+        raise UgsError(
+            f"В лист {columns}×{rows} помещается {capacity} кадров, загружено {len(frames)}."
+        )
+    assert report.width is not None and report.height is not None
+    sheet = Image.new(
+        "RGBA", (columns * report.width, rows * report.height), (0, 0, 0, 0)
+    )
+    for index, frame in enumerate(frames):
+        sheet.alpha_composite(
+            frame.convert("RGBA"),
+            ((index % columns) * report.width, (index // columns) * report.height),
+        )
+    return sheet
+
+
+def export_png_frames(
+    frames: list[Image.Image], output_dir: Path, overwrite: bool = False
+) -> list[Path]:
+    """Export all loaded frames with stable frame_000.png numbering."""
+    report = validate_frames(frames)
+    if report.errors:
+        raise UgsError("\n".join(report.errors))
+    digits = max(3, len(str(len(frames) - 1)))
+    targets = [output_dir / f"frame_{index:0{digits}d}.png" for index in range(len(frames))]
+    existing = [path for path in targets if path.exists()]
+    if existing and not overwrite:
+        raise UgsError(
+            f"В папке уже есть экспортируемые кадры ({len(existing)}). Разрешите замену."
+        )
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for frame, target in zip(frames, targets):
+            frame.convert("RGBA").save(target)
+    except OSError as exc:
+        raise UgsError(f"Не удалось экспортировать PNG: {exc}") from exc
+    return targets
+
+
 def extract_ugs(source: Path, output_dir: Path) -> tuple[int, tuple[int, int]]:
     frames = read_ugs(source)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -494,6 +541,7 @@ def run_gui() -> None:
     grid_photos: list[ImageTk.PhotoImage] = []
     animation_photo: ImageTk.PhotoImage | None = None
     animation_position = 0
+    selected_frame_index = 0
     animation_running = True
     last_built_ugs: Path | None = None
     suggested_stem = "sprites"
@@ -631,16 +679,26 @@ def run_gui() -> None:
     play_button.configure(command=toggle_animation)
 
     def select_cell(index: int) -> None:
-        nonlocal animation_position
+        nonlocal animation_position, selected_frame_index
         if index >= len(frames):
             return
+        selected_frame_index = index
         direction_var.set(str(index // GRID_COLUMNS + 1))
         animation_position = index % GRID_COLUMNS
         show_animation_frame()
+        refresh_selection()
         status_var.set(f"Выбран кадр {index:03d}, строка {index // GRID_COLUMNS + 1}.")
 
     for index, label in enumerate(grid_labels):
         label.bind("<Button-1>", lambda _event, selected=index: select_cell(selected))
+
+    def refresh_selection() -> None:
+        for index, label in enumerate(grid_labels):
+            label.configure(
+                relief="sunken"
+                if index == selected_frame_index and index < len(frames)
+                else "ridge"
+            )
 
     def refresh_grid() -> None:
         grid_photos.clear()
@@ -651,12 +709,14 @@ def run_gui() -> None:
                 label.configure(image=photo, text="", width=0)
             else:
                 label.configure(image="", text=f"{index:02d}", width=7)
+        refresh_selection()
         show_animation_frame()
 
     def set_frames(new_frames: list[Image.Image], caption: str, stem: str) -> None:
-        nonlocal frames, animation_position, suggested_stem
+        nonlocal frames, animation_position, selected_frame_index, suggested_stem
         frames = [frame.convert("RGBA") for frame in new_frames]
         animation_position = 0
+        selected_frame_index = 0
         suggested_stem = stem or "sprites"
         source_var.set(caption)
         report = validate_frames(frames)
@@ -874,6 +934,105 @@ def run_gui() -> None:
             f"Установлено:\n{target}\n\nРезервная копия:\n{backup}",
         )
 
+    def export_selected_clicked() -> None:
+        if not frames:
+            messagebox.showerror("Экспорт", "Сначала загрузите кадры.")
+            return
+        destination_name = filedialog.asksaveasfilename(
+            title="Экспортировать выбранный кадр",
+            initialdir=last_directory,
+            initialfile=f"{suggested_stem}-frame-{selected_frame_index:03d}.png",
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png")],
+        )
+        if not destination_name:
+            return
+        destination = Path(destination_name)
+        if destination.exists() and not messagebox.askyesno(
+            "Подтверждение", f"Файл уже существует:\n{destination}\n\nЗаменить его?"
+        ):
+            return
+        try:
+            frames[selected_frame_index].convert("RGBA").save(destination)
+        except OSError as exc:
+            messagebox.showerror("Ошибка экспорта", f"Не удалось сохранить PNG: {exc}")
+            return
+        remember(destination)
+        status_var.set(f"Экспортирован кадр {selected_frame_index:03d}: {destination.name}")
+
+    def export_all_clicked() -> None:
+        if not frames:
+            messagebox.showerror("Экспорт", "Сначала загрузите кадры.")
+            return
+        output_name = filedialog.askdirectory(
+            title="Папка для всех кадров", initialdir=last_directory
+        )
+        if not output_name:
+            return
+        output_dir = Path(output_name)
+        existing = list(output_dir.glob("frame_*.png"))
+        overwrite = False
+        if existing:
+            digits = max(3, len(str(len(frames) - 1)))
+            expected_names = {
+                f"frame_{index:0{digits}d}.png" for index in range(len(frames))
+            }
+            extras = [path for path in existing if path.name not in expected_names]
+            if extras:
+                messagebox.showerror(
+                    "Папка содержит лишние кадры",
+                    f"Найдено лишних frame_*.png: {len(extras)}. "
+                    "Выберите пустую папку, чтобы старые кадры не попали в следующую сборку.",
+                )
+                return
+            overwrite = messagebox.askyesno(
+                "Подтверждение",
+                f"В папке уже есть frame_*.png: {len(existing)}.\n\nЗаменить совпадающие файлы?",
+            )
+            if not overwrite:
+                return
+        try:
+            exported = export_png_frames(frames, output_dir, overwrite=overwrite)
+        except UgsError as exc:
+            messagebox.showerror("Ошибка экспорта", str(exc))
+            return
+        remember(output_dir)
+        offer_to_open(output_dir, f"Экспортировано кадров: {len(exported)}\n{output_dir}")
+
+    def export_sheet_clicked() -> None:
+        if not frames:
+            messagebox.showerror("Экспорт", "Сначала загрузите кадры.")
+            return
+        report = validate_frames(frames)
+        if report.errors:
+            messagebox.showerror("Нельзя создать лист", report_text(report))
+            return
+        if report.warnings and not messagebox.askyesno(
+            "Неполная сетка", report_text(report) + "\n\nПустые ячейки останутся прозрачными. Продолжить?"
+        ):
+            return
+        destination_name = filedialog.asksaveasfilename(
+            title="Экспортировать спрайт-лист 8×8",
+            initialdir=last_directory,
+            initialfile=f"{suggested_stem}-sheet-8x8.png",
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png")],
+        )
+        if not destination_name:
+            return
+        destination = Path(destination_name)
+        if destination.exists() and not messagebox.askyesno(
+            "Подтверждение", f"Файл уже существует:\n{destination}\n\nЗаменить его?"
+        ):
+            return
+        try:
+            make_sprite_sheet(frames).save(destination)
+        except (OSError, UgsError) as exc:
+            messagebox.showerror("Ошибка экспорта", str(exc))
+            return
+        remember(destination)
+        offer_to_open(destination, f"Спрайт-лист 8×8 сохранён:\n{destination}")
+
     def offer_to_open(path: Path, summary: str) -> None:
         if not messagebox.askyesno("Готово", summary + "\n\nОткрыть папку с результатом?"):
             return
@@ -904,6 +1063,20 @@ def run_gui() -> None:
             f"Размер файла: {details.file_size:,} байт\n"
             f"SHA-256: {details.sha256}",
         )
+
+    export_box = ttk.LabelFrame(controls, text="Экспорт PNG", padding=8)
+    export_box.pack(fill="x", pady=(0, 8))
+    export_box.columnconfigure(0, weight=1)
+    export_box.columnconfigure(1, weight=1)
+    ttk.Button(
+        export_box, text="Выбранный кадр", command=export_selected_clicked
+    ).grid(row=0, column=0, sticky="ew", padx=(0, 3), pady=2)
+    ttk.Button(export_box, text="Все кадры", command=export_all_clicked).grid(
+        row=0, column=1, sticky="ew", padx=(3, 0), pady=2
+    )
+    ttk.Button(export_box, text="Спрайт-лист 8×8", command=export_sheet_clicked).grid(
+        row=1, column=0, columnspan=2, sticky="ew", pady=2
+    )
 
     actions = ttk.LabelFrame(controls, text="Действия", padding=8)
     actions.pack(fill="x")

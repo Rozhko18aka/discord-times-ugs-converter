@@ -1,0 +1,8 @@
+*
+!/.gitignore
+!/README.md
+!/README_UGS_CONVERTER.md
+!/requirements.txt
+!/ugs_converter.py
+!/launch_converter.bat
+!/Запустить UGS Converter.bat

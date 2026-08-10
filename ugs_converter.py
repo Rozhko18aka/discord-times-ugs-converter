@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Converter for Discord Times .ugs unit sprite containers.
+"""Converter for Discord Times UGS sprite containers and LIT images.
 
 UGS layout used by the game:
     repeated records of <uint16 width><uint16 height><width*height uint16 pixels>
@@ -38,10 +38,44 @@ FRAME_NAME_RE = re.compile(r"^frame_(\d+)\.png$", re.IGNORECASE)
 GRID_COLUMNS = 8
 GRID_ROWS = 8
 UNIT_FRAME_COUNT = GRID_COLUMNS * GRID_ROWS
+LIT_MAGIC = b"LIT\0"
+LIT_VALID_FLAGS = frozenset((0, 2, 4, 6, 8, 10))
+LIT_FLAG_SUBSAMPLED = 0x02
+LIT_FLAG_RAW = 0x04
+LIT_FLAG_ALPHA = 0x08
+LIT_MAX_PIXELS = 64_000_000
+
+# A conservative JPEG-style table.  The slightly larger DC divisor keeps the
+# unshifted 0..255 LIT samples inside the signed-byte coefficient range.
+LIT_QUANT_TABLE = bytes(
+    (
+        17, 11, 10, 16, 24, 40, 51, 61,
+        12, 12, 14, 19, 26, 58, 60, 55,
+        14, 13, 16, 24, 40, 57, 69, 56,
+        14, 17, 22, 29, 51, 87, 80, 62,
+        18, 22, 37, 56, 68, 109, 103, 77,
+        24, 35, 55, 64, 81, 104, 113, 92,
+        49, 64, 78, 87, 103, 121, 120, 101,
+        72, 92, 95, 98, 112, 100, 103, 99,
+    )
+)
+LIT_COEFFICIENT_ORDER = bytes(range(64))
+LIT_DCT_MATRIX = tuple(
+    tuple(
+        math.cos((2 * sample + 1) * frequency * math.pi / 16)
+        * (1 / math.sqrt(2) if frequency == 0 else 1)
+        for frequency in range(8)
+    )
+    for sample in range(8)
+)
 
 
 class UgsError(Exception):
     """A user-facing validation error."""
+
+
+class LitError(UgsError):
+    """A user-facing LIT validation error."""
 
 
 @dataclass(frozen=True)
@@ -51,6 +85,25 @@ class UgsInfo:
     height: int
     file_size: int
     sha256: str
+
+
+@dataclass(frozen=True)
+class LitInfo:
+    width: int
+    height: int
+    flags: int
+    file_size: int
+    sha256: str
+    compressed: bool
+    subsampled: bool
+    has_alpha: bool
+
+    @property
+    def format_name(self) -> str:
+        if not self.compressed:
+            return "YCbCr без сжатия"
+        color = "YCbCr 4:2:0" if self.subsampled else "YCbCr 4:4:4"
+        return f"DCT {color}" + (" + Alpha" if self.has_alpha else "")
 
 
 @dataclass(frozen=True)
@@ -73,6 +126,378 @@ def calculate_window_size(screen_width: int, screen_height: int) -> tuple[int, i
     width = min(screen_width, max(720, min(1100, int(screen_width * 0.88))))
     height = min(screen_height, max(500, min(760, int(screen_height * 0.82))))
     return width, height
+
+
+def _round_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+def _lit_layout(width: int, height: int, flags: int) -> tuple[int, int, int]:
+    if flags not in LIT_VALID_FLAGS:
+        raise LitError(f"Неподдерживаемые флаги LIT: {flags}.")
+    if width <= 0 or height <= 0 or width * height > LIT_MAX_PIXELS:
+        raise LitError(f"Некорректный размер LIT: {width}×{height}.")
+    if flags & LIT_FLAG_RAW:
+        return width, height, 16 + width * height * 3
+
+    alignment = 16 if flags & LIT_FLAG_SUBSAMPLED else 8
+    padded_width = _round_up(width, alignment)
+    padded_height = _round_up(height, alignment)
+    full_samples = padded_width * padded_height
+    full_plane_size = 128 + full_samples
+    if flags & LIT_FLAG_SUBSAMPLED:
+        chroma_plane_size = 128 + full_samples // 4
+    else:
+        chroma_plane_size = full_plane_size
+    expected_size = 16 + full_plane_size + 2 * chroma_plane_size
+    if flags & LIT_FLAG_ALPHA:
+        expected_size += full_plane_size
+    return padded_width, padded_height, expected_size
+
+
+def _parse_lit_header(data: bytes) -> tuple[int, int, int, int, int]:
+    if len(data) < 16:
+        raise LitError("Оборван заголовок LIT.")
+    magic, width, height, flags = struct.unpack_from("<4sIII", data)
+    if magic != LIT_MAGIC:
+        raise LitError("Файл не является LIT: отсутствует сигнатура LIT\\0.")
+    padded_width, padded_height, expected_size = _lit_layout(width, height, flags)
+    if len(data) != expected_size:
+        difference = len(data) - expected_size
+        detail = f"лишних байт: {difference}" if difference > 0 else f"не хватает байт: {-difference}"
+        raise LitError(
+            f"Некорректный размер LIT: получено {len(data)}, ожидалось {expected_size} ({detail})."
+        )
+    return width, height, flags, padded_width, padded_height
+
+
+def _decode_lit_plane(
+    chunk: memoryview, blocks_x: int, blocks_y: int
+) -> bytearray:
+    block_count = blocks_x * blocks_y
+    expected_size = 128 + block_count * 64
+    if len(chunk) != expected_size:
+        raise LitError("Оборвана сжатая плоскость LIT.")
+    quantizers = bytes(chunk[:64])
+    order = bytes(chunk[64:128])
+    if 0 in quantizers:
+        raise LitError("В таблице квантования LIT найден нулевой делитель.")
+    if set(order) != set(range(64)):
+        raise LitError("Таблица порядка коэффициентов LIT повреждена.")
+
+    encoded = chunk[128:]
+    width = blocks_x * 8
+    result = bytearray(width * blocks_y * 8)
+    matrix = LIT_DCT_MATRIX
+    for block_index in range(block_count):
+        coefficients: list[int] = []
+        for index in range(64):
+            value = encoded[order[index] * block_count + block_index]
+            signed_value = value - 256 if value > 127 else value
+            coefficients.append(signed_value * quantizers[index])
+
+        # Separable, unshifted 8×8 inverse DCT used by the game.
+        intermediate = [[0.0] * 8 for _ in range(8)]
+        for y in range(8):
+            row_matrix = matrix[y]
+            for u in range(8):
+                intermediate[y][u] = sum(
+                    row_matrix[v] * coefficients[v * 8 + u] for v in range(8)
+                )
+
+        block_x = block_index % blocks_x * 8
+        block_y = block_index // blocks_x * 8
+        for y in range(8):
+            destination = (block_y + y) * width + block_x
+            intermediate_row = intermediate[y]
+            for x in range(8):
+                value = round(
+                    sum(matrix[x][u] * intermediate_row[u] for u in range(8)) / 4
+                )
+                result[destination + x] = max(0, min(255, value))
+    return result
+
+
+def _smooth_lit_chroma(samples: bytearray, blocks_x: int, blocks_y: int) -> None:
+    """Apply the block-boundary filter from the original game decoder."""
+    width = blocks_x * 8
+    for block_y in range(1, blocks_y):
+        upper = (block_y * 8 - 1) * width
+        lower = upper + width
+        for x in range(width):
+            correction = int((samples[upper + x] - samples[lower + x]) / 4)
+            samples[upper + x] -= correction
+            samples[lower + x] += correction
+    for block_x in range(1, blocks_x):
+        for y in range(blocks_y * 8):
+            right = y * width + block_x * 8
+            left = right - 1
+            correction = int((samples[left] - samples[right]) / 4)
+            samples[left] -= correction
+            samples[right] += correction
+
+
+def _upsample_lit_chroma(samples: bytearray, blocks_x: int, blocks_y: int) -> bytearray:
+    """Reproduce the game's 2× chroma expansion and smoothing filter."""
+    width = blocks_x * 8
+    height = blocks_y * 8
+    output_width = width * 2
+    output_height = height * 2
+    output = bytearray(output_width * output_height)
+    for y in range(height):
+        for x in range(width):
+            value = samples[y * width + x]
+            destination = y * 2 * output_width + x * 2
+            output[destination] = value
+            output[destination + 1] = value
+            output[destination + output_width] = value
+            output[destination + output_width + 1] = value
+
+    for y in range(output_height):
+        row = y * output_width
+        previous = output[row]
+        for x in range(1, output_width - 1):
+            current = output[row + x]
+            output[row + x] = (2 * current + previous + output[row + x + 1]) // 4
+            previous = current
+    for x in range(output_width):
+        previous = output[x]
+        for y in range(1, output_height - 1):
+            position = y * output_width + x
+            current = output[position]
+            output[position] = (
+                2 * current + previous + output[position + output_width]
+            ) // 4
+            previous = current
+    return output
+
+
+def decode_lit(data: bytes) -> Image.Image:
+    """Decode one complete LIT file into an RGBA Pillow image."""
+    width, height, flags, padded_width, padded_height = _parse_lit_header(data)
+    if flags & LIT_FLAG_RAW:
+        return Image.frombytes("YCbCr", (width, height), data[16:]).convert("RGBA")
+
+    view = memoryview(data)
+    offset = 16
+    blocks_x = padded_width // 8
+    blocks_y = padded_height // 8
+    full_plane_size = 128 + padded_width * padded_height
+    luminance = _decode_lit_plane(view[offset : offset + full_plane_size], blocks_x, blocks_y)
+    offset += full_plane_size
+
+    if flags & LIT_FLAG_SUBSAMPLED:
+        chroma_blocks_x = blocks_x // 2
+        chroma_blocks_y = blocks_y // 2
+    else:
+        chroma_blocks_x = blocks_x
+        chroma_blocks_y = blocks_y
+    chroma_plane_size = 128 + chroma_blocks_x * chroma_blocks_y * 64
+    blue_chroma = _decode_lit_plane(
+        view[offset : offset + chroma_plane_size], chroma_blocks_x, chroma_blocks_y
+    )
+    offset += chroma_plane_size
+    red_chroma = _decode_lit_plane(
+        view[offset : offset + chroma_plane_size], chroma_blocks_x, chroma_blocks_y
+    )
+    offset += chroma_plane_size
+    _smooth_lit_chroma(blue_chroma, chroma_blocks_x, chroma_blocks_y)
+    _smooth_lit_chroma(red_chroma, chroma_blocks_x, chroma_blocks_y)
+    if flags & LIT_FLAG_SUBSAMPLED:
+        blue_chroma = _upsample_lit_chroma(blue_chroma, chroma_blocks_x, chroma_blocks_y)
+        red_chroma = _upsample_lit_chroma(red_chroma, chroma_blocks_x, chroma_blocks_y)
+
+    planes = (
+        Image.frombytes("L", (padded_width, padded_height), bytes(luminance)),
+        Image.frombytes("L", (padded_width, padded_height), bytes(blue_chroma)),
+        Image.frombytes("L", (padded_width, padded_height), bytes(red_chroma)),
+    )
+    image = Image.merge("YCbCr", planes).convert("RGBA").crop((0, 0, width, height))
+    if flags & LIT_FLAG_ALPHA:
+        alpha = _decode_lit_plane(
+            view[offset : offset + full_plane_size], blocks_x, blocks_y
+        )
+        image.putalpha(
+            Image.frombytes("L", (padded_width, padded_height), bytes(alpha)).crop(
+                (0, 0, width, height)
+            )
+        )
+    return image
+
+
+def read_lit(path: Path) -> Image.Image:
+    try:
+        return decode_lit(path.read_bytes())
+    except OSError as exc:
+        raise LitError(f"Не удалось прочитать LIT: {exc}") from exc
+
+
+def inspect_lit(path: Path) -> LitInfo:
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise LitError(f"Не удалось прочитать LIT: {exc}") from exc
+    width, height, flags, _padded_width, _padded_height = _parse_lit_header(data)
+    # Decode as part of validation so corrupt coefficient tables are also found.
+    decode_lit(data)
+    return LitInfo(
+        width=width,
+        height=height,
+        flags=flags,
+        file_size=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
+        compressed=not bool(flags & LIT_FLAG_RAW),
+        subsampled=bool(flags & LIT_FLAG_SUBSAMPLED),
+        has_alpha=bool(flags & LIT_FLAG_ALPHA),
+    )
+
+
+def _pad_lit_plane(plane: Image.Image, width: int, height: int) -> Image.Image:
+    if plane.mode != "L":
+        plane = plane.convert("L")
+    if plane.size == (width, height):
+        return plane.copy()
+    padded = Image.new("L", (width, height))
+    padded.paste(plane, (0, 0))
+    if plane.width < width:
+        edge = plane.crop((plane.width - 1, 0, plane.width, plane.height)).resize(
+            (width - plane.width, plane.height), Image.Resampling.NEAREST
+        )
+        padded.paste(edge, (plane.width, 0))
+    if plane.height < height:
+        edge = padded.crop((0, plane.height - 1, width, plane.height)).resize(
+            (width, height - plane.height), Image.Resampling.NEAREST
+        )
+        padded.paste(edge, (0, plane.height))
+    return padded
+
+
+def _encode_lit_plane(plane: Image.Image) -> bytes:
+    width, height = plane.size
+    if width % 8 or height % 8:
+        raise LitError("Внутренняя плоскость LIT должна делиться на 8.")
+    blocks_x = width // 8
+    blocks_y = height // 8
+    block_count = blocks_x * blocks_y
+    frequency_data = [bytearray(block_count) for _ in range(64)]
+    pixels = plane.load()
+    matrix = LIT_DCT_MATRIX
+
+    for block_index in range(block_count):
+        origin_x = block_index % blocks_x * 8
+        origin_y = block_index // blocks_x * 8
+        intermediate = [[0.0] * 8 for _ in range(8)]
+        for y in range(8):
+            for u in range(8):
+                intermediate[y][u] = sum(
+                    matrix[x][u] * pixels[origin_x + x, origin_y + y] for x in range(8)
+                )
+        for v in range(8):
+            for u in range(8):
+                coefficient = sum(
+                    matrix[y][v] * intermediate[y][u] for y in range(8)
+                ) / 4
+                quantized = max(
+                    -128,
+                    min(127, round(coefficient / LIT_QUANT_TABLE[v * 8 + u])),
+                )
+                frequency_data[v * 8 + u][block_index] = quantized & 0xFF
+
+    return b"".join(
+        (LIT_QUANT_TABLE, LIT_COEFFICIENT_ORDER, *(bytes(values) for values in frequency_data))
+    )
+
+
+def choose_lit_flags(image: Image.Image, preferred: int | None = None) -> int:
+    """Choose a compatible format while preserving an original format when possible."""
+    alpha = image.convert("RGBA").getchannel("A")
+    has_transparency = alpha.getextrema()[0] < 255
+    if preferred in LIT_VALID_FLAGS:
+        if not has_transparency or preferred & LIT_FLAG_ALPHA:
+            return preferred
+    return 8 if has_transparency else 4
+
+
+def encode_lit(image: Image.Image, flags: int | None = None) -> bytes:
+    """Encode a Pillow image into a game-compatible LIT byte stream."""
+    rgba = image.convert("RGBA")
+    width, height = rgba.size
+    selected_flags = choose_lit_flags(rgba) if flags is None else flags
+    padded_width, padded_height, _expected_size = _lit_layout(width, height, selected_flags)
+    has_transparency = rgba.getchannel("A").getextrema()[0] < 255
+    if has_transparency and not selected_flags & LIT_FLAG_ALPHA:
+        raise LitError("Выбранный вариант LIT не поддерживает прозрачность PNG.")
+
+    header = struct.pack("<4sIII", LIT_MAGIC, width, height, selected_flags)
+    ycbcr = rgba.convert("RGB").convert("YCbCr")
+    if selected_flags & LIT_FLAG_RAW:
+        return header + ycbcr.tobytes()
+
+    luminance, blue_chroma, red_chroma = ycbcr.split()
+    luminance = _pad_lit_plane(luminance, padded_width, padded_height)
+    blue_chroma = _pad_lit_plane(blue_chroma, padded_width, padded_height)
+    red_chroma = _pad_lit_plane(red_chroma, padded_width, padded_height)
+    if selected_flags & LIT_FLAG_SUBSAMPLED:
+        chroma_size = (padded_width // 2, padded_height // 2)
+        blue_chroma = blue_chroma.resize(chroma_size, Image.Resampling.BOX)
+        red_chroma = red_chroma.resize(chroma_size, Image.Resampling.BOX)
+
+    parts = [
+        header,
+        _encode_lit_plane(luminance),
+        _encode_lit_plane(blue_chroma),
+        _encode_lit_plane(red_chroma),
+    ]
+    if selected_flags & LIT_FLAG_ALPHA:
+        alpha = _pad_lit_plane(rgba.getchannel("A"), padded_width, padded_height)
+        parts.append(_encode_lit_plane(alpha))
+    encoded = b"".join(parts)
+    if len(encoded) != _expected_size:
+        raise LitError("Внутренняя ошибка при расчёте размера LIT.")
+    return encoded
+
+
+def write_lit(
+    image: Image.Image,
+    destination: Path,
+    overwrite: bool = False,
+    flags: int | None = None,
+) -> LitInfo:
+    if destination.exists() and not overwrite:
+        raise LitError(f"Файл уже существует: {destination}. Используйте --force для замены.")
+    data = encode_lit(image, flags)
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+    except OSError as exc:
+        raise LitError(f"Не удалось сохранить LIT: {exc}") from exc
+    return inspect_lit(destination)
+
+
+def extract_lit(source: Path, destination: Path, overwrite: bool = False) -> LitInfo:
+    if destination.exists() and not overwrite:
+        raise LitError(f"Файл уже существует: {destination}. Используйте --force для замены.")
+    image = read_lit(source)
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        image.save(destination, "PNG")
+    except OSError as exc:
+        raise LitError(f"Не удалось сохранить PNG: {exc}") from exc
+    return inspect_lit(source)
+
+
+def build_lit(
+    source: Path,
+    destination: Path,
+    overwrite: bool = False,
+    flags: int | None = None,
+) -> LitInfo:
+    try:
+        with Image.open(source) as opened:
+            image = opened.convert("RGBA")
+    except (OSError, ValueError) as exc:
+        raise LitError(f"Не удалось открыть PNG: {exc}") from exc
+    return write_lit(image, destination, overwrite, flags)
 
 
 def rotate_left_16(value: int, count: int) -> int:
@@ -590,7 +1015,7 @@ def run_gui() -> None:
         TkinterDnD = None
 
     root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
-    root.title("Discord Times — UGS Converter")
+    root.title("Discord Times — Graphics Converter")
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
     window_width, window_height = calculate_window_size(screen_width, screen_height)
@@ -611,8 +1036,20 @@ def run_gui() -> None:
     grid_cell_size = 58
     grid_resize_job: str | None = None
     animation_preview_size = max(96, min(140, window_height // 5))
+    lit_image: Image.Image | None = None
+    lit_source_path: Path | None = None
+    lit_original_flags: int | None = None
+    lit_photo: ImageTk.PhotoImage | None = None
+    lit_dirty = False
 
-    outer = ttk.Frame(root, padding=12)
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True)
+    ugs_tab = ttk.Frame(notebook)
+    lit_tab = ttk.Frame(notebook)
+    notebook.add(ugs_tab, text="UGS — спрайты")
+    notebook.add(lit_tab, text="LIT — изображения")
+
+    outer = ttk.Frame(ugs_tab, padding=12)
     outer.pack(fill="both", expand=True)
     controls_width = min(360, max(300, window_width // 3))
     controls_shell = ttk.Frame(outer, width=controls_width)
@@ -1326,11 +1763,316 @@ def run_gui() -> None:
         ),
     )
 
+    # LIT converter lives in its own workspace so the UGS controls stay compact.
+    lit_outer = ttk.Frame(lit_tab, padding=12)
+    lit_outer.pack(fill="both", expand=True)
+    lit_controls = ttk.Frame(lit_outer, width=controls_width)
+    lit_controls.pack(side="left", fill="y", padx=(0, 14))
+    lit_controls.pack_propagate(False)
+    lit_preview = ttk.LabelFrame(lit_outer, text="Предпросмотр", padding=10)
+    lit_preview.pack(side="left", fill="both", expand=True)
+
+    ttk.Label(lit_controls, text="LIT Converter", font=("Segoe UI", 18, "bold")).pack(
+        anchor="w", pady=(2, 4)
+    )
+    ttk.Label(
+        lit_controls,
+        text="Открывайте игровые LIT, экспортируйте их в PNG и собирайте обратно после редактирования.",
+        wraplength=controls_width - 25,
+        justify="left",
+    ).pack(anchor="w", pady=(0, 12))
+    lit_source_var = tk.StringVar(value="Изображение не загружено")
+    lit_info_var = tk.StringVar(
+        value="Перетащите сюда LIT или PNG." if DND_FILES is not None else "Откройте LIT или импортируйте PNG."
+    )
+    lit_source_box = ttk.LabelFrame(lit_controls, text="Текущее изображение", padding=8)
+    lit_source_box.pack(fill="x", pady=(0, 10))
+    ttk.Label(
+        lit_source_box,
+        textvariable=lit_source_var,
+        wraplength=controls_width - 50,
+        justify="left",
+    ).pack(anchor="w")
+    ttk.Label(
+        lit_source_box,
+        textvariable=lit_info_var,
+        wraplength=controls_width - 50,
+        justify="left",
+        foreground="#555555",
+    ).pack(anchor="w", pady=(4, 0))
+
+    lit_preview_label = ttk.Label(
+        lit_preview,
+        text="Нет изображения",
+        anchor="center",
+    )
+    lit_preview_label.pack(fill="both", expand=True)
+    lit_preview_job: str | None = None
+
+    def make_lit_preview(image: Image.Image, width: int, height: int) -> Image.Image:
+        width = max(64, width)
+        height = max(64, height)
+        background = Image.new("RGBA", (width, height), (68, 68, 68, 255))
+        draw = ImageDraw.Draw(background)
+        tile = max(8, min(width, height) // 18)
+        for y in range(0, height, tile):
+            for x in range(0, width, tile):
+                shade = 52 if ((x // tile) + (y // tile)) % 2 else 78
+                draw.rectangle(
+                    (x, y, x + tile - 1, y + tile - 1), fill=(shade,) * 3 + (255,)
+                )
+        scale = min(width / image.width, height / image.height)
+        size = (
+            max(1, round(image.width * scale)),
+            max(1, round(image.height * scale)),
+        )
+        resampling = Image.Resampling.NEAREST if scale >= 1 else Image.Resampling.LANCZOS
+        scaled = image.convert("RGBA").resize(size, resampling)
+        background.alpha_composite(
+            scaled, ((width - scaled.width) // 2, (height - scaled.height) // 2)
+        )
+        return background
+
+    def refresh_lit_preview() -> None:
+        nonlocal lit_photo, lit_preview_job
+        lit_preview_job = None
+        if lit_image is None:
+            lit_preview_label.configure(image="", text="Нет изображения")
+            return
+        width = max(100, lit_preview.winfo_width() - 24)
+        height = max(100, lit_preview.winfo_height() - 34)
+        rendered = make_lit_preview(lit_image, width, height)
+        lit_photo = ImageTk.PhotoImage(rendered)
+        lit_preview_label.configure(image=lit_photo, text="")
+
+    def schedule_lit_preview(_event: object | None = None) -> None:
+        nonlocal lit_preview_job
+        if lit_preview_job is not None:
+            root.after_cancel(lit_preview_job)
+        lit_preview_job = root.after(80, refresh_lit_preview)
+
+    lit_preview.bind("<Configure>", schedule_lit_preview)
+
+    def update_lit_description() -> None:
+        if lit_image is None:
+            lit_source_var.set("Изображение не загружено")
+            lit_info_var.set("Откройте LIT или импортируйте PNG.")
+            return
+        flags = choose_lit_flags(lit_image, lit_original_flags)
+        format_info = LitInfo(
+            width=lit_image.width,
+            height=lit_image.height,
+            flags=flags,
+            file_size=0,
+            sha256="",
+            compressed=not bool(flags & LIT_FLAG_RAW),
+            subsampled=bool(flags & LIT_FLAG_SUBSAMPLED),
+            has_alpha=bool(flags & LIT_FLAG_ALPHA),
+        )
+        name = lit_source_path.name if lit_source_path is not None else "Новый LIT из PNG"
+        lit_source_var.set(name + (" • изменён" if lit_dirty else ""))
+        lit_info_var.set(
+            f"{lit_image.width}×{lit_image.height} • тип {flags} • {format_info.format_name}"
+        )
+
+    def set_lit_image(
+        image: Image.Image,
+        source: Path | None,
+        flags: int | None,
+        dirty: bool,
+    ) -> None:
+        nonlocal lit_image, lit_source_path, lit_original_flags, lit_dirty
+        lit_image = image.convert("RGBA")
+        lit_source_path = source
+        lit_original_flags = choose_lit_flags(lit_image, flags)
+        lit_dirty = dirty
+        update_lit_description()
+        schedule_lit_preview()
+
+    def load_lit_path(source: Path) -> None:
+        try:
+            data = source.read_bytes()
+            width, height, flags, _padded_width, _padded_height = _parse_lit_header(data)
+            lit_info_var.set(f"Чтение {width}×{height}…")
+            root.update_idletasks()
+            image = decode_lit(data)
+        except (OSError, LitError) as exc:
+            messagebox.showerror("Ошибка LIT", str(exc))
+            return
+        remember(source)
+        set_lit_image(image, source, flags, False)
+        notebook.select(lit_tab)
+
+    def open_lit_clicked() -> None:
+        source_name = filedialog.askopenfilename(
+            title="Открыть LIT",
+            initialdir=last_directory,
+            filetypes=[("Discord Times LIT", "*.lit"), ("Все файлы", "*.*")],
+        )
+        if source_name:
+            load_lit_path(Path(source_name))
+
+    def import_lit_png(source: Path | None = None) -> None:
+        if source is None:
+            source_name = filedialog.askopenfilename(
+                title="Импортировать PNG в LIT",
+                initialdir=last_directory,
+                filetypes=[("PNG", "*.png")],
+            )
+            if not source_name:
+                return
+            source = Path(source_name)
+        try:
+            with Image.open(source) as opened:
+                image = opened.convert("RGBA")
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Ошибка PNG", f"Не удалось открыть PNG: {exc}")
+            return
+        remember(source)
+        preferred = lit_original_flags if lit_image is not None else None
+        set_lit_image(image, lit_source_path, preferred, True)
+        notebook.select(lit_tab)
+
+    def export_lit_png_clicked() -> None:
+        if lit_image is None:
+            messagebox.showerror("Экспорт PNG", "Сначала откройте LIT.")
+            return
+        stem = lit_source_path.stem if lit_source_path is not None else "image"
+        destination_name = filedialog.asksaveasfilename(
+            title="Экспортировать LIT в PNG",
+            initialdir=last_directory,
+            initialfile=f"{stem}.png",
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png")],
+        )
+        if not destination_name:
+            return
+        destination = Path(destination_name)
+        if destination.exists() and not messagebox.askyesno(
+            "Подтверждение", f"Файл уже существует:\n{destination}\n\nЗаменить его?"
+        ):
+            return
+        try:
+            lit_image.save(destination, "PNG")
+        except OSError as exc:
+            messagebox.showerror("Ошибка экспорта", f"Не удалось сохранить PNG: {exc}")
+            return
+        remember(destination)
+        messagebox.showinfo("Готово", f"PNG сохранён:\n{destination}")
+
+    def save_lit_clicked() -> None:
+        nonlocal lit_source_path, lit_original_flags, lit_dirty
+        if lit_image is None:
+            messagebox.showerror("Сборка LIT", "Сначала импортируйте PNG или откройте LIT.")
+            return
+        if lit_source_path is not None:
+            initial_file = f"{lit_source_path.stem}-new.lit"
+        else:
+            initial_file = "image-new.lit"
+        destination_name = filedialog.asksaveasfilename(
+            title="Собрать LIT",
+            initialdir=last_directory,
+            initialfile=initial_file,
+            defaultextension=".lit",
+            filetypes=[("Discord Times LIT", "*.lit")],
+        )
+        if not destination_name:
+            return
+        destination = Path(destination_name)
+        if destination.exists() and not messagebox.askyesno(
+            "Подтверждение", f"Файл уже существует:\n{destination}\n\nСоздать резервную копию и заменить?"
+        ):
+            return
+        backup: Path | None = None
+        try:
+            original_data = None
+            if not lit_dirty and lit_source_path is not None and lit_source_path.is_file():
+                original_data = lit_source_path.read_bytes()
+            if destination.exists():
+                backup = create_backup(destination)
+            lit_info_var.set("Сборка LIT…")
+            root.update_idletasks()
+            if original_data is not None:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(original_data)
+                details = inspect_lit(destination)
+            else:
+                flags = choose_lit_flags(lit_image, lit_original_flags)
+                details = write_lit(lit_image, destination, overwrite=True, flags=flags)
+        except (OSError, UgsError) as exc:
+            messagebox.showerror("Ошибка сборки LIT", str(exc))
+            update_lit_description()
+            return
+        remember(destination)
+        lit_source_path = destination
+        lit_original_flags = details.flags
+        lit_dirty = False
+        update_lit_description()
+        backup_line = f"\nРезервная копия: {backup}" if backup is not None else ""
+        messagebox.showinfo(
+            "LIT собран",
+            f"{details.width}×{details.height} • тип {details.flags}\n{destination}{backup_line}",
+        )
+
+    def validate_lit_clicked() -> None:
+        if lit_image is None:
+            messagebox.showerror("Проверка LIT", "Сначала откройте или соберите изображение.")
+            return
+        try:
+            if lit_source_path is not None and not lit_dirty:
+                details = inspect_lit(lit_source_path)
+            else:
+                flags = choose_lit_flags(lit_image, lit_original_flags)
+                encoded = encode_lit(lit_image, flags)
+                restored = decode_lit(encoded)
+                details = LitInfo(
+                    width=restored.width,
+                    height=restored.height,
+                    flags=flags,
+                    file_size=len(encoded),
+                    sha256=hashlib.sha256(encoded).hexdigest(),
+                    compressed=not bool(flags & LIT_FLAG_RAW),
+                    subsampled=bool(flags & LIT_FLAG_SUBSAMPLED),
+                    has_alpha=bool(flags & LIT_FLAG_ALPHA),
+                )
+        except LitError as exc:
+            messagebox.showerror("LIT повреждён", str(exc))
+            return
+        messagebox.showinfo(
+            "LIT исправен",
+            f"Размер: {details.width}×{details.height}\n"
+            f"Тип: {details.flags} • {details.format_name}\n"
+            f"Размер файла: {details.file_size:,} байт\n"
+            f"SHA-256: {details.sha256}",
+        )
+
+    lit_actions = ttk.LabelFrame(lit_controls, text="Конвертер", padding=8)
+    lit_actions.pack(fill="x")
+    add_button_grid(
+        lit_actions,
+        (
+            ("Открыть LIT", open_lit_clicked),
+            ("Экспорт PNG", export_lit_png_clicked),
+            ("Импорт PNG", import_lit_png),
+            ("Собрать LIT", save_lit_clicked),
+            ("Проверить LIT", validate_lit_clicked),
+        ),
+    )
+
     if DND_FILES is not None:
         def on_drop(event: object) -> None:
             raw = getattr(event, "data", "")
             dropped = [Path(item) for item in root.tk.splitlist(raw)]
-            load_paths(dropped)
+            if len(dropped) == 1 and dropped[0].suffix.lower() == ".lit":
+                load_lit_path(dropped[0])
+            elif (
+                len(dropped) == 1
+                and dropped[0].suffix.lower() == ".png"
+                and notebook.select() == str(lit_tab)
+            ):
+                import_lit_png(dropped[0])
+            else:
+                load_paths(dropped)
 
         root.drop_target_register(DND_FILES)
         root.dnd_bind("<<Drop>>", on_drop)
@@ -1346,7 +2088,7 @@ def run_gui() -> None:
 
 
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Конвертер спрайтов Discord Times UGS ↔ PNG")
+    parser = argparse.ArgumentParser(description="Конвертер графики Discord Times UGS/LIT ↔ PNG")
     subparsers = parser.add_subparsers(dest="command")
 
     extract_parser = subparsers.add_parser("extract", help="распаковать UGS в PNG")
@@ -1367,6 +2109,35 @@ def create_parser() -> argparse.ArgumentParser:
     install_parser.add_argument(
         "--yes", action="store_true", help="подтвердить замену и создание резервной копии"
     )
+
+    lit_extract_parser = subparsers.add_parser(
+        "lit-extract", help="преобразовать LIT в PNG"
+    )
+    lit_extract_parser.add_argument("source", type=Path, help="исходный .lit")
+    lit_extract_parser.add_argument("destination", type=Path, help="выходной .png")
+    lit_extract_parser.add_argument(
+        "--force", action="store_true", help="разрешить замену существующего PNG"
+    )
+
+    lit_build_parser = subparsers.add_parser(
+        "lit-build", help="собрать LIT из PNG"
+    )
+    lit_build_parser.add_argument("source", type=Path, help="исходный .png")
+    lit_build_parser.add_argument("destination", type=Path, help="выходной .lit")
+    lit_build_parser.add_argument(
+        "--flags",
+        type=int,
+        choices=sorted(LIT_VALID_FLAGS),
+        help="тип LIT 0/2/4/6/8/10; без параметра выбирается автоматически",
+    )
+    lit_build_parser.add_argument(
+        "--force", action="store_true", help="разрешить замену существующего LIT"
+    )
+
+    lit_inspect_parser = subparsers.add_parser(
+        "lit-inspect", help="проверить LIT и показать сведения"
+    )
+    lit_inspect_parser.add_argument("source", type=Path, help="проверяемый .lit")
     return parser
 
 
@@ -1399,6 +2170,27 @@ def main(argv: list[str] | None = None) -> int:
                 raise UgsError("Для установки добавьте --yes после проверки выбранных путей.")
             backup = install_ugs(args.source, args.target)
             print(f"Готово: установлен {args.target}\nРезервная копия: {backup}")
+        elif args.command == "lit-extract":
+            details = extract_lit(args.source, args.destination, args.force)
+            print(
+                f"Готово: LIT {details.width}x{details.height}, тип {details.flags} "
+                f"экспортирован в {args.destination}"
+            )
+        elif args.command == "lit-build":
+            details = build_lit(
+                args.source, args.destination, args.force, args.flags
+            )
+            print(
+                f"Готово: собран LIT {details.width}x{details.height}, "
+                f"тип {details.flags} в {args.destination}"
+            )
+        elif args.command == "lit-inspect":
+            details = inspect_lit(args.source)
+            print(
+                f"LIT исправен: {details.width}x{details.height}, тип {details.flags}, "
+                f"{details.format_name}, {details.file_size} байт\n"
+                f"SHA-256: {details.sha256}"
+            )
     except UgsError as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1

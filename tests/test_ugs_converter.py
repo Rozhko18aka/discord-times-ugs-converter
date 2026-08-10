@@ -6,14 +6,23 @@ from pathlib import Path
 from PIL import Image
 
 from ugs_converter import (
+    LIT_MAGIC,
+    LIT_VALID_FLAGS,
+    LitError,
     UgsError,
     build_ugs,
+    build_lit,
     calculate_window_size,
+    choose_lit_flags,
     create_backup,
+    decode_lit,
     decode_ugs_pixel,
+    encode_lit,
     encode_ugs_pixel,
     export_png_frames,
+    extract_lit,
     extract_ugs,
+    inspect_lit,
     inspect_ugs,
     install_ugs,
     make_preview,
@@ -26,6 +35,7 @@ from ugs_converter import (
     split_sprite_sheet,
     validate_frames,
     write_ugs,
+    write_lit,
 )
 
 
@@ -51,6 +61,85 @@ class InterfaceSizingTests(unittest.TestCase):
 
     def test_window_never_exceeds_small_screen(self) -> None:
         self.assertEqual(calculate_window_size(640, 480), (640, 480))
+
+
+class LitFormatTests(unittest.TestCase):
+    def test_all_known_lit_variants_encode_and_decode(self) -> None:
+        opaque = Image.new("RGBA", (13, 11), (180, 70, 25, 255))
+        transparent = Image.new("RGBA", (13, 11), (180, 70, 25, 96))
+
+        for flags in sorted(LIT_VALID_FLAGS):
+            source = transparent if flags in (8, 10) else opaque
+            encoded = encode_lit(source, flags)
+            magic, width, height, stored_flags = struct.unpack_from("<4sIII", encoded)
+            restored = decode_lit(encoded)
+
+            self.assertEqual(magic, LIT_MAGIC)
+            self.assertEqual((width, height, stored_flags), (13, 11, flags))
+            self.assertEqual(restored.size, source.size)
+            self.assertEqual(restored.mode, "RGBA")
+            if flags in (8, 10):
+                alpha_min, alpha_max = restored.getchannel("A").getextrema()
+                self.assertLessEqual(abs(alpha_min - 96), 2)
+                self.assertLessEqual(abs(alpha_max - 96), 2)
+            else:
+                self.assertEqual(restored.getchannel("A").getextrema(), (255, 255))
+
+    def test_raw_lit_stores_ycbcr_triplets_without_compression(self) -> None:
+        source = Image.new("RGB", (2, 1))
+        source.putdata([(255, 0, 0), (0, 255, 0)])
+        encoded = encode_lit(source, 4)
+
+        self.assertEqual(encoded[16:], source.convert("YCbCr").tobytes())
+        restored = decode_lit(encoded).convert("RGB")
+        restored_pixels = (
+            restored.get_flattened_data() if hasattr(restored, "get_flattened_data") else restored.getdata()
+        )
+        source_pixels = (
+            source.get_flattened_data() if hasattr(source, "get_flattened_data") else source.getdata()
+        )
+        for actual, expected in zip(restored_pixels, source_pixels):
+            self.assertTrue(all(abs(a - e) <= 3 for a, e in zip(actual, expected)))
+
+    def test_new_png_chooses_raw_or_alpha_format(self) -> None:
+        self.assertEqual(choose_lit_flags(Image.new("RGBA", (1, 1), (0, 0, 0, 255))), 4)
+        self.assertEqual(choose_lit_flags(Image.new("RGBA", (1, 1), (0, 0, 0, 0))), 8)
+        self.assertEqual(
+            choose_lit_flags(Image.new("RGBA", (1, 1), (0, 0, 0, 128)), preferred=10),
+            10,
+        )
+
+    def test_lit_rejects_bad_header_size_and_flags(self) -> None:
+        with self.assertRaises(LitError):
+            decode_lit(b"not a lit")
+        with self.assertRaises(LitError):
+            decode_lit(struct.pack("<4sIII", LIT_MAGIC, 8, 8, 1))
+        with self.assertRaises(LitError):
+            decode_lit(struct.pack("<4sIII", LIT_MAGIC, 8, 8, 4))
+
+    def test_lit_file_workflow_exports_and_rebuilds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_png = root / "source.png"
+            lit_path = root / "source.lit"
+            exported_png = root / "exported.png"
+            rebuilt_lit = root / "rebuilt.lit"
+            Image.new("RGBA", (9, 7), (20, 90, 160, 120)).save(source_png)
+
+            built = build_lit(source_png, lit_path)
+            self.assertEqual(built.flags, 8)
+            exported = extract_lit(lit_path, exported_png)
+            self.assertEqual(exported.width, 9)
+            rebuilt = write_lit(Image.open(exported_png), rebuilt_lit)
+            self.assertEqual(rebuilt.flags, 8)
+            self.assertEqual(inspect_lit(rebuilt_lit).height, 7)
+
+    def test_lit_write_guards_existing_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "image.lit"
+            destination.write_bytes(b"existing")
+            with self.assertRaises(LitError):
+                write_lit(Image.new("RGBA", (2, 2)), destination)
 
 
 class ContainerRoundTripTests(unittest.TestCase):

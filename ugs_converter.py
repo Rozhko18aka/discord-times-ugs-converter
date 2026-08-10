@@ -295,6 +295,48 @@ def load_png_frames(paths: list[Path]) -> list[Image.Image]:
     return frames
 
 
+def replace_selected_frame(
+    frames: list[Image.Image], index: int, replacement: Image.Image
+) -> list[Image.Image]:
+    """Return a copy of a frame set with one size-compatible replacement."""
+    if not frames:
+        raise UgsError("Сначала загрузите кадры.")
+    if index < 0 or index >= len(frames):
+        raise UgsError(f"Кадр {index} отсутствует.")
+    if replacement.size != frames[index].size:
+        raise UgsError(
+            f"Размер нового кадра {replacement.width}×{replacement.height}, "
+            f"ожидался {frames[index].width}×{frames[index].height}."
+        )
+    result = list(frames)
+    result[index] = replacement.convert("RGBA")
+    return result
+
+
+def replace_all_frames(
+    frames: list[Image.Image], replacements: list[Image.Image]
+) -> list[Image.Image]:
+    """Validate and return a complete frame-set replacement."""
+    if not frames:
+        raise UgsError("Сначала загрузите исходный UGS или спрайт-лист.")
+    if len(replacements) != len(frames):
+        raise UgsError(
+            f"Количество новых кадров: {len(replacements)}, ожидалось: {len(frames)}."
+        )
+    expected_size = frames[0].size
+    wrong_sizes = [
+        index for index, frame in enumerate(replacements) if frame.size != expected_size
+    ]
+    if wrong_sizes:
+        shown = ", ".join(str(index) for index in wrong_sizes[:10])
+        suffix = "…" if len(wrong_sizes) > 10 else ""
+        raise UgsError(
+            f"Новые кадры другого размера: {shown}{suffix}. "
+            f"Ожидался размер {expected_size[0]}×{expected_size[1]}."
+        )
+    return [frame.convert("RGBA") for frame in replacements]
+
+
 def split_sprite_sheet(
     source: Path, columns: int = GRID_COLUMNS, rows: int = GRID_ROWS
 ) -> list[Image.Image]:
@@ -962,7 +1004,7 @@ def run_gui() -> None:
             filetypes=[("UGS sprites", "*.ugs"), ("Все файлы", "*.*")],
         )
         if source_name:
-            load_ugs_path(Path(source_name), offer_export=True)
+            load_ugs_path(Path(source_name), offer_export=False)
 
     def validate_clicked() -> None:
         report = validate_frames(frames, workspace_expected_count)
@@ -1151,6 +1193,62 @@ def run_gui() -> None:
         remember(destination)
         offer_to_open(destination, f"Спрайт-лист 8×8 сохранён:\n{destination}")
 
+    def replace_selected_clicked() -> None:
+        nonlocal frames
+        if not frames:
+            messagebox.showerror("Замена кадра", "Сначала откройте UGS или импортируйте лист.")
+            return
+        source_name = filedialog.askopenfilename(
+            title=f"PNG для кадра {selected_frame_index:03d}",
+            initialdir=last_directory,
+            filetypes=[("PNG", "*.png")],
+        )
+        if not source_name:
+            return
+        source = Path(source_name)
+        try:
+            replacement = load_png_frames([source])[0]
+            frames = replace_selected_frame(frames, selected_frame_index, replacement)
+        except UgsError as exc:
+            messagebox.showerror("Замена кадра", str(exc))
+            return
+        remember(source)
+        refresh_grid()
+        status_var.set(f"Кадр {selected_frame_index:03d} заменён: {source.name}")
+
+    def replace_all_clicked() -> None:
+        nonlocal frames
+        if not frames:
+            messagebox.showerror("Замена кадров", "Сначала откройте UGS или импортируйте лист.")
+            return
+        folder_name = filedialog.askdirectory(
+            title="Папка с новыми кадрами", initialdir=last_directory
+        )
+        if not folder_name:
+            return
+        folder = Path(folder_name)
+        try:
+            has_numbered = any(
+                path.is_file() and FRAME_NAME_RE.match(path.name)
+                for path in folder.iterdir()
+            )
+            if has_numbered:
+                paths = find_frames(folder)
+            else:
+                paths = [
+                    path
+                    for path in folder.glob("*.png")
+                    if path.name.lower() != "preview_sheet.png"
+                ]
+            replacements = load_png_frames(paths)
+            frames = replace_all_frames(frames, replacements)
+        except (OSError, UgsError) as exc:
+            messagebox.showerror("Замена кадров", str(exc))
+            return
+        remember(folder)
+        refresh_grid()
+        status_var.set(f"Заменены все кадры: {len(frames)} из папки {folder.name}")
+
     def offer_to_open(path: Path, summary: str) -> None:
         if not messagebox.askyesno("Готово", summary + "\n\nОткрыть папку с результатом?"):
             return
@@ -1182,42 +1280,51 @@ def run_gui() -> None:
             f"SHA-256: {details.sha256}",
         )
 
-    export_box = ttk.LabelFrame(controls, text="Экспорт PNG", padding=8)
-    export_box.pack(fill="x", pady=(0, 8))
-    export_box.columnconfigure(0, weight=1)
-    export_box.columnconfigure(1, weight=1)
-    ttk.Button(
-        export_box, text="Выбранный кадр", command=export_selected_clicked
-    ).grid(row=0, column=0, sticky="ew", padx=(0, 3), pady=2)
-    ttk.Button(export_box, text="Все кадры", command=export_all_clicked).grid(
-        row=0, column=1, sticky="ew", padx=(3, 0), pady=2
-    )
-    ttk.Button(export_box, text="Спрайт-лист 8×8", command=export_sheet_clicked).grid(
-        row=1, column=0, columnspan=2, sticky="ew", pady=2
+    def add_button_grid(parent: ttk.LabelFrame, items: tuple[tuple[str, object], ...]) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=1)
+        for index, (text, command) in enumerate(items):
+            ttk.Button(parent, text=text, command=command).grid(
+                row=index // 2,
+                column=index % 2,
+                columnspan=2 if len(items) % 2 and index == len(items) - 1 else 1,
+                sticky="ew",
+                padx=(0, 3) if index % 2 == 0 and index != len(items) - 1 else (3, 0),
+                pady=2,
+            )
+
+    main_actions = ttk.LabelFrame(controls, text="Основное", padding=8)
+    main_actions.pack(fill="x", pady=(0, 8))
+    add_button_grid(
+        main_actions,
+        (
+            ("Открыть UGS", open_ugs_clicked),
+            ("Собрать UGS", build_clicked),
+            ("Импорт листа 8×8", import_sheet_clicked),
+            ("Проверить кадры", validate_clicked),
+        ),
     )
 
-    actions = ttk.LabelFrame(controls, text="Действия", padding=8)
-    actions.pack(fill="x")
-    action_items = (
-        ("Открыть / распаковать UGS", open_ugs_clicked),
-        ("Выбрать папку PNG", choose_frame_folder),
-        ("Выбрать PNG-файлы", choose_png_files),
-        ("Импортировать спрайт-лист 8×8", import_sheet_clicked),
-        ("Проверить загруженные кадры", validate_clicked),
-        ("Собрать UGS", build_clicked),
-        ("Проверить отдельный UGS", inspect_clicked),
-        ("Установить UGS в игру", install_clicked),
+    export_actions = ttk.LabelFrame(controls, text="Экспорт", padding=8)
+    export_actions.pack(fill="x", pady=(0, 8))
+    add_button_grid(
+        export_actions,
+        (
+            ("Лист 8×8", export_sheet_clicked),
+            ("Выбранный кадр", export_selected_clicked),
+            ("Все кадры", export_all_clicked),
+        ),
     )
-    actions.columnconfigure(0, weight=1)
-    actions.columnconfigure(1, weight=1)
-    for index, (text, command) in enumerate(action_items):
-        ttk.Button(actions, text=text, command=command).grid(
-            row=index // 2,
-            column=index % 2,
-            sticky="ew",
-            padx=(0, 3) if index % 2 == 0 else (3, 0),
-            pady=2,
-        )
+
+    replace_actions = ttk.LabelFrame(controls, text="Замена", padding=8)
+    replace_actions.pack(fill="x")
+    add_button_grid(
+        replace_actions,
+        (
+            ("Выбранный кадр", replace_selected_clicked),
+            ("Все из папки", replace_all_clicked),
+        ),
+    )
 
     if DND_FILES is not None:
         def on_drop(event: object) -> None:

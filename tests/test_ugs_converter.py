@@ -19,6 +19,8 @@ from ugs_converter import (
     make_preview,
     make_sprite_sheet,
     read_ugs,
+    replace_all_frames,
+    replace_selected_frame,
     rotate_left_16,
     rotate_right_16,
     split_sprite_sheet,
@@ -180,6 +182,29 @@ class ContainerRoundTripTests(unittest.TestCase):
                 decoded = read_ugs(source)
                 write_ugs(decoded, rebuilt)
                 self.assertEqual(rebuilt.read_bytes(), source.read_bytes())
+
+    def test_selected_frame_replacement_checks_size(self) -> None:
+        frames = [Image.new("RGBA", (4, 3), (index, 0, 0, 255)) for index in range(2)]
+        replacement = Image.new("RGB", (4, 3), (99, 0, 0))
+        result = replace_selected_frame(frames, 1, replacement)
+
+        self.assertEqual(result[1].mode, "RGBA")
+        self.assertEqual(result[1].getpixel((0, 0)), (99, 0, 0, 255))
+        self.assertEqual(frames[1].getpixel((0, 0)), (1, 0, 0, 255))
+        with self.assertRaises(UgsError):
+            replace_selected_frame(frames, 0, Image.new("RGBA", (3, 3)))
+
+    def test_all_frame_replacement_checks_count_and_size(self) -> None:
+        frames = [Image.new("RGBA", (4, 3)) for _ in range(2)]
+        replacements = [Image.new("RGB", (4, 3)) for _ in range(2)]
+        result = replace_all_frames(frames, replacements)
+        self.assertEqual(len(result), 2)
+        self.assertTrue(all(frame.mode == "RGBA" for frame in result))
+
+        with self.assertRaises(UgsError):
+            replace_all_frames(frames, replacements[:1])
+        with self.assertRaises(UgsError):
+            replace_all_frames(frames, [Image.new("RGBA", (4, 3)), Image.new("RGBA", (3, 3))])
 
     def test_install_replaces_target_and_preserves_backup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

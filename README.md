@@ -18,6 +18,7 @@
 - импорт спрайт-листа 8×8;
 - экспорт выбранного кадра, всех кадров или прозрачного спрайт-листа 8×8;
 - адаптивный интерфейс для разных разрешений и масштаба Windows;
+- собственная иконка приложения на основе `HeroBonus2`;
 - поддержка UGS интерфейса игры с 1, 8, 50 и другим количеством кадров;
 - безопасная установка UGS в игру с проверкой совместимости и резервной копией.
 - отдельная вкладка LIT с адаптивным предпросмотром;
@@ -68,7 +69,7 @@ Workflow **Build Windows EXE** создаст GitHub Release и прикрепи
 
 ```powershell
 python -m pip install -r requirements-build.txt
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name Discord-Times-Graphics-Converter --additional-hooks-dir . ugs_converter.py
+python -m PyInstaller --noconfirm --clean --onefile --windowed --icon assets/app-icon.ico --add-data assets/app-icon.ico:assets --name Discord-Times-Graphics-Converter --additional-hooks-dir . ugs_converter.py
 ```
 
 ## Командная строка
@@ -107,7 +108,7 @@ LIT хранит одно изображение в цветовом прост�
 
 ## Правовой статус
 
-Проект не содержит файлов игры, игровых изображений или иных ресурсов Discord Times. Пользователь самостоятельно отвечает за наличие прав на конвертируемые материалы.
+Проект не содержит файлов игры UGS/LIT и других наборов игровых ресурсов. Исключение — иконка приложения, созданная на основе предоставленного изображения `HeroBonus2.png`. Пользователь самостоятельно отвечает за наличие прав на конвертируемые материалы.
 
 Сам конвертер распространяется по лицензии [MIT](LICENSE). Список выпусков и изменений находится в [CHANGELOG.md](CHANGELOG.md).
 

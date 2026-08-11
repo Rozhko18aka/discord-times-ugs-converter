@@ -5,6 +5,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/build-windows.yml"
+      - "assets/**"
       - "hook-tkinterdnd2.py"
       - "requirements.txt"
       - "requirements-build.txt"
@@ -48,6 +49,8 @@ jobs:
           --clean
           --onefile
           --windowed
+          --icon assets/app-icon.ico
+          --add-data assets/app-icon.ico:assets
           --name Discord-Times-Graphics-Converter
           --additional-hooks-dir .
           ugs_converter.py

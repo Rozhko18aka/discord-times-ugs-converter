@@ -10,6 +10,9 @@
 !/Запустить UGS Converter.bat
 !/LICENSE
 !/CHANGELOG.md
+!/assets/
+!/assets/app-icon-master.png
+!/assets/app-icon.ico
 !/tests/
 !/tests/test_ugs_converter.py
 !/.github/

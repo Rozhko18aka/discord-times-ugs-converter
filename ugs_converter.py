@@ -1028,6 +1028,12 @@ def build_ugs(input_dir: Path, destination: Path, overwrite: bool = False) -> tu
     return write_ugs(frames, destination, overwrite)
 
 
+def resource_path(relative_path: str | Path) -> Path:
+    """Return a bundled resource path for source and PyInstaller launches."""
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return bundle_root / relative_path
+
+
 def run_gui() -> None:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
@@ -1041,6 +1047,11 @@ def run_gui() -> None:
 
     root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
     root.title("Discord Times — Graphics Converter")
+    try:
+        root.iconbitmap(default=str(resource_path("assets/app-icon.ico")))
+    except (OSError, tk.TclError):
+        # The converter still works when an unpackaged source copy has no icon.
+        pass
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
     window_width, window_height = calculate_window_size(screen_width, screen_height)

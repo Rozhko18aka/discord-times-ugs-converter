@@ -32,6 +32,7 @@ from ugs_converter import (
     read_ugs,
     replace_all_frames,
     replace_selected_frame,
+    resource_path,
     rotate_left_16,
     rotate_right_16,
     split_sprite_sheet,
@@ -74,6 +75,24 @@ class InterfaceSizingTests(unittest.TestCase):
     def test_preview_fit_rejects_invalid_dimensions(self) -> None:
         with self.assertRaises(ValueError):
             fit_image_inside(0, 32, 800, 600)
+
+
+class AppIconTests(unittest.TestCase):
+    def test_icon_assets_have_transparency_and_windows_sizes(self) -> None:
+        master_path = resource_path("assets/app-icon-master.png")
+        ico_path = resource_path("assets/app-icon.ico")
+
+        with Image.open(master_path) as master:
+            self.assertEqual(master.mode, "RGBA")
+            self.assertEqual(master.size, (1024, 1024))
+            self.assertEqual(master.getpixel((0, 0))[3], 0)
+
+        with Image.open(ico_path) as icon:
+            self.assertEqual(icon.format, "ICO")
+            sizes = icon.info["sizes"]
+            self.assertIn((16, 16), sizes)
+            self.assertIn((32, 32), sizes)
+            self.assertIn((256, 256), sizes)
 
 
 class LitFormatTests(unittest.TestCase):

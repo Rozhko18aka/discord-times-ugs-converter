@@ -23,6 +23,7 @@ from ugs_converter import (
     extract_lit,
     extract_ugs,
     find_lit_files,
+    fit_image_inside,
     inspect_lit,
     inspect_ugs,
     install_ugs,
@@ -62,6 +63,17 @@ class InterfaceSizingTests(unittest.TestCase):
 
     def test_window_never_exceeds_small_screen(self) -> None:
         self.assertEqual(calculate_window_size(640, 480), (640, 480))
+
+    def test_small_lit_preview_keeps_original_scale(self) -> None:
+        self.assertEqual(fit_image_inside(64, 32, 800, 600), (64, 32))
+
+    def test_large_lit_preview_fits_inside_frame(self) -> None:
+        self.assertEqual(fit_image_inside(1024, 512, 600, 400), (600, 300))
+        self.assertEqual(fit_image_inside(400, 800, 600, 300), (150, 300))
+
+    def test_preview_fit_rejects_invalid_dimensions(self) -> None:
+        with self.assertRaises(ValueError):
+            fit_image_inside(0, 32, 800, 600)
 
 
 class LitFormatTests(unittest.TestCase):

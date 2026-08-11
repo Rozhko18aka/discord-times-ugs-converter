@@ -128,6 +128,16 @@ def calculate_window_size(screen_width: int, screen_height: int) -> tuple[int, i
     return width, height
 
 
+def fit_image_inside(
+    image_width: int, image_height: int, area_width: int, area_height: int
+) -> tuple[int, int]:
+    """Fit an image inside an area without ever enlarging it."""
+    if min(image_width, image_height, area_width, area_height) <= 0:
+        raise ValueError("Image and area dimensions must be positive")
+    scale = min(1.0, area_width / image_width, area_height / image_height)
+    return max(1, round(image_width * scale)), max(1, round(image_height * scale))
+
+
 def _round_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
@@ -1872,13 +1882,11 @@ def run_gui() -> None:
                 draw.rectangle(
                     (x, y, x + tile - 1, y + tile - 1), fill=(shade,) * 3 + (255,)
                 )
-        scale = min(width / image.width, height / image.height)
-        size = (
-            max(1, round(image.width * scale)),
-            max(1, round(image.height * scale)),
-        )
-        resampling = Image.Resampling.NEAREST if scale >= 1 else Image.Resampling.LANCZOS
-        scaled = image.convert("RGBA").resize(size, resampling)
+        size = fit_image_inside(image.width, image.height, width, height)
+        if size == image.size:
+            scaled = image.convert("RGBA")
+        else:
+            scaled = image.convert("RGBA").resize(size, Image.Resampling.LANCZOS)
         background.alpha_composite(
             scaled, ((width - scaled.width) // 2, (height - scaled.height) // 2)
         )

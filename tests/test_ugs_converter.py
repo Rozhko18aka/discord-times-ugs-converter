@@ -22,6 +22,7 @@ from ugs_converter import (
     export_png_frames,
     extract_lit,
     extract_ugs,
+    find_lit_files,
     inspect_lit,
     inspect_ugs,
     install_ugs,
@@ -140,6 +141,28 @@ class LitFormatTests(unittest.TestCase):
             destination.write_bytes(b"existing")
             with self.assertRaises(LitError):
                 write_lit(Image.new("RGBA", (2, 2)), destination)
+
+    def test_lit_folder_scan_is_recursive_case_insensitive_and_sorted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            nested = root / "Nested"
+            nested.mkdir()
+            (root / "zeta.LIT").write_bytes(b"")
+            (root / "alpha.lit").write_bytes(b"")
+            (nested / "middle.LiT").write_bytes(b"")
+            (nested / "ignore.png").write_bytes(b"")
+
+            files = find_lit_files(root)
+
+            self.assertEqual(
+                [str(path.relative_to(root)) for path in files],
+                ["alpha.lit", str(Path("Nested") / "middle.LiT"), "zeta.LIT"],
+            )
+
+    def test_lit_folder_scan_rejects_missing_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(LitError):
+                find_lit_files(Path(temporary) / "missing")
 
 
 class ContainerRoundTripTests(unittest.TestCase):

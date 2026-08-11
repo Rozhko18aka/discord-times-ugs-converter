@@ -500,6 +500,21 @@ def build_lit(
     return write_lit(image, destination, overwrite, flags)
 
 
+def find_lit_files(folder: Path) -> list[Path]:
+    """Return all LIT files in a folder and its subfolders in stable order."""
+    if not folder.is_dir():
+        raise LitError(f"Папка не найдена: {folder}")
+    try:
+        files = [
+            path
+            for path in folder.rglob("*")
+            if path.is_file() and path.suffix.lower() == ".lit"
+        ]
+    except OSError as exc:
+        raise LitError(f"Не удалось прочитать папку LIT: {exc}") from exc
+    return sorted(files, key=lambda path: str(path.relative_to(folder)).casefold())
+
+
 def rotate_left_16(value: int, count: int) -> int:
     count %= 16
     return ((value << count) | (value >> (16 - count))) & 0xFFFF
@@ -1041,6 +1056,9 @@ def run_gui() -> None:
     lit_original_flags: int | None = None
     lit_photo: ImageTk.PhotoImage | None = None
     lit_dirty = False
+    lit_folder_root: Path | None = None
+    lit_folder_files: list[Path] = []
+    lit_folder_index = -1
 
     notebook = ttk.Notebook(root)
     notebook.pack(fill="both", expand=True)
@@ -1801,6 +1819,39 @@ def run_gui() -> None:
         foreground="#555555",
     ).pack(anchor="w", pady=(4, 0))
 
+    lit_folder_var = tk.StringVar(value="Папка LIT не выбрана")
+    lit_file_var = tk.StringVar()
+    lit_folder_box = ttk.LabelFrame(lit_controls, text="Файлы в папке", padding=8)
+    lit_folder_box.pack(fill="x", pady=(0, 10))
+    ttk.Label(
+        lit_folder_box,
+        textvariable=lit_folder_var,
+        wraplength=controls_width - 50,
+        foreground="#555555",
+    ).pack(anchor="w", pady=(0, 5))
+    lit_file_combo = ttk.Combobox(
+        lit_folder_box,
+        textvariable=lit_file_var,
+        state="readonly",
+    )
+    lit_file_combo.pack(fill="x")
+    lit_navigation = ttk.Frame(lit_folder_box)
+    lit_navigation.pack(fill="x", pady=(6, 0))
+    lit_previous_button = ttk.Button(
+        lit_navigation,
+        text="← Назад",
+        command=lambda: step_lit_folder(-1),
+        state="disabled",
+    )
+    lit_previous_button.pack(side="left", fill="x", expand=True, padx=(0, 3))
+    lit_next_button = ttk.Button(
+        lit_navigation,
+        text="Вперёд →",
+        command=lambda: step_lit_folder(1),
+        state="disabled",
+    )
+    lit_next_button.pack(side="left", fill="x", expand=True, padx=(3, 0))
+
     lit_preview_label = ttk.Label(
         lit_preview,
         text="Нет изображения",
@@ -1889,8 +1940,51 @@ def run_gui() -> None:
         update_lit_description()
         schedule_lit_preview()
 
-    def load_lit_path(source: Path) -> None:
+    def update_lit_folder_controls() -> None:
+        if lit_folder_root is None or not lit_folder_files:
+            lit_folder_var.set("Папка LIT не выбрана")
+            lit_file_combo.configure(values=())
+            lit_file_var.set("")
+            lit_previous_button.configure(state="disabled")
+            lit_next_button.configure(state="disabled")
+            return
+        lit_folder_var.set(
+            f"{lit_folder_root.name or lit_folder_root} • файлов: {len(lit_folder_files)}"
+        )
+        names = [
+            str(path.relative_to(lit_folder_root)) for path in lit_folder_files
+        ]
+        lit_file_combo.configure(values=names)
+        if 0 <= lit_folder_index < len(lit_folder_files):
+            lit_file_combo.current(lit_folder_index)
+        else:
+            lit_file_var.set("")
+        lit_previous_button.configure(
+            state="normal" if lit_folder_index > 0 else "disabled"
+        )
+        lit_next_button.configure(
+            state=(
+                "normal"
+                if lit_folder_index < len(lit_folder_files) - 1
+                else "disabled"
+            )
+        )
+
+    def confirm_discard_lit_changes() -> bool:
+        if not lit_dirty:
+            return True
+        return messagebox.askyesno(
+            "Несохранённые изменения",
+            "Импортированное PNG ещё не сохранено в LIT. Открыть другой файл и потерять изменения?",
+        )
+
+    def load_lit_path(source: Path, confirm_discard: bool = True) -> bool:
+        nonlocal lit_folder_index
+        if confirm_discard and not confirm_discard_lit_changes():
+            update_lit_folder_controls()
+            return False
         try:
+            source = source.resolve()
             data = source.read_bytes()
             width, height, flags, _padded_width, _padded_height = _parse_lit_header(data)
             lit_info_var.set(f"Чтение {width}×{height}…")
@@ -1898,10 +1992,18 @@ def run_gui() -> None:
             image = decode_lit(data)
         except (OSError, LitError) as exc:
             messagebox.showerror("Ошибка LIT", str(exc))
-            return
+            update_lit_description()
+            update_lit_folder_controls()
+            return False
         remember(source)
         set_lit_image(image, source, flags, False)
+        try:
+            lit_folder_index = lit_folder_files.index(source)
+        except ValueError:
+            lit_folder_index = -1
+        update_lit_folder_controls()
         notebook.select(lit_tab)
+        return True
 
     def open_lit_clicked() -> None:
         source_name = filedialog.askopenfilename(
@@ -1911,6 +2013,50 @@ def run_gui() -> None:
         )
         if source_name:
             load_lit_path(Path(source_name))
+
+    def open_lit_folder(folder: Path | None = None) -> None:
+        nonlocal lit_folder_root, lit_folder_files, lit_folder_index
+        if folder is None:
+            folder_name = filedialog.askdirectory(
+                title="Открыть папку с LIT", initialdir=last_directory
+            )
+            if not folder_name:
+                return
+            folder = Path(folder_name)
+        if not confirm_discard_lit_changes():
+            return
+        try:
+            folder = folder.resolve()
+            files = find_lit_files(folder)
+        except (OSError, LitError) as exc:
+            messagebox.showerror("Папка LIT", str(exc))
+            return
+        if not files:
+            messagebox.showinfo(
+                "Папка LIT", f"В папке и её подпапках не найдено файлов .lit:\n{folder}"
+            )
+            return
+        lit_folder_root = folder
+        lit_folder_files = files
+        lit_folder_index = 0
+        remember(folder)
+        update_lit_folder_controls()
+        notebook.select(lit_tab)
+        load_lit_path(files[0], confirm_discard=False)
+
+    def select_lit_folder_file(_event: object | None = None) -> None:
+        index = lit_file_combo.current()
+        if 0 <= index < len(lit_folder_files):
+            load_lit_path(lit_folder_files[index])
+
+    def step_lit_folder(offset: int) -> None:
+        if not lit_folder_files:
+            return
+        start = lit_folder_index if lit_folder_index >= 0 else -1
+        target = max(0, min(len(lit_folder_files) - 1, start + offset))
+        load_lit_path(lit_folder_files[target])
+
+    lit_file_combo.bind("<<ComboboxSelected>>", select_lit_folder_file)
 
     def import_lit_png(source: Path | None = None) -> None:
         if source is None:
@@ -2052,6 +2198,7 @@ def run_gui() -> None:
         lit_actions,
         (
             ("Открыть LIT", open_lit_clicked),
+            ("Папка LIT", open_lit_folder),
             ("Экспорт PNG", export_lit_png_clicked),
             ("Импорт PNG", import_lit_png),
             ("Собрать LIT", save_lit_clicked),
@@ -2063,7 +2210,13 @@ def run_gui() -> None:
         def on_drop(event: object) -> None:
             raw = getattr(event, "data", "")
             dropped = [Path(item) for item in root.tk.splitlist(raw)]
-            if len(dropped) == 1 and dropped[0].suffix.lower() == ".lit":
+            if (
+                len(dropped) == 1
+                and dropped[0].is_dir()
+                and notebook.select() == str(lit_tab)
+            ):
+                open_lit_folder(dropped[0])
+            elif len(dropped) == 1 and dropped[0].suffix.lower() == ".lit":
                 load_lit_path(dropped[0])
             elif (
                 len(dropped) == 1

@@ -30,6 +30,14 @@
 
 ## Быстрый запуск в Windows
 
+### Готовый EXE
+
+Откройте страницу [Releases](https://github.com/Rozhko18aka/discord-times-ugs-converter/releases), скачайте `Discord-Times-Graphics-Converter.exe` из последнего выпуска и запустите его. Устанавливать Python и зависимости не требуется.
+
+До первого официального выпуска тестовую сборку можно получить на странице **Actions → Build Windows EXE**: запустите workflow вручную и скачайте артефакт `Discord-Times-Graphics-Converter-Windows`.
+
+### Запуск из исходного кода
+
 1. Установите [Python 3](https://www.python.org/downloads/).
 2. Установите Pillow:
 
@@ -44,6 +52,24 @@
    ```
 
 Подробная русскоязычная инструкция находится в [README_UGS_CONVERTER.md](README_UGS_CONVERTER.md).
+
+## Создание выпуска
+
+GitHub автоматически собирает portable EXE на Windows, проверяет его запуск и считает SHA-256. Чтобы опубликовать новую версию после слияния изменений в `main`, создайте и отправьте тег:
+
+```powershell
+git switch main
+git pull
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+Workflow **Build Windows EXE** создаст GitHub Release и прикрепит к нему EXE и файл контрольной суммы. Для локальной проверки сборки используйте:
+
+```powershell
+python -m pip install -r requirements-build.txt
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name Discord-Times-Graphics-Converter --additional-hooks-dir . ugs_converter.py
+```
 
 ## Командная строка
 

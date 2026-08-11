@@ -4,6 +4,10 @@
 
 ## Быстрый запуск
 
+Самый простой способ — скачать `Discord-Times-Graphics-Converter.exe` из раздела [Releases](https://github.com/Rozhko18aka/discord-times-ugs-converter/releases). Это готовая portable-версия: Python устанавливать не нужно.
+
+Если готового выпуска ещё нет, автор проекта может запустить **Build Windows EXE** на вкладке **Actions** и скачать тестовую сборку из блока Artifacts.
+
 Дважды щёлкните **`Запустить UGS Converter.bat`**. В окне находятся две независимые вкладки: **UGS — спрайты** и **LIT — изображения**.
 
 На вкладке UGS оставлены только основные действия:

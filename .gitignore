@@ -3,7 +3,9 @@
 !/README.md
 !/README_UGS_CONVERTER.md
 !/requirements.txt
+!/requirements-build.txt
 !/ugs_converter.py
+!/hook-tkinterdnd2.py
 !/launch_converter.bat
 !/Запустить UGS Converter.bat
 !/LICENSE
@@ -13,5 +15,6 @@
 !/.github/
 !/.github/workflows/
 !/.github/workflows/tests.yml
+!/.github/workflows/build-windows.yml
 !/.github/ISSUE_TEMPLATE/
 !/.github/ISSUE_TEMPLATE/bug_report.yml

@@ -1172,17 +1172,28 @@ def run_gui() -> None:
     grid_box.pack(fill="both", expand=True)
     grid_frame = ttk.Frame(grid_box)
     grid_frame.pack(anchor="center", expand=True)
+    grid_cells: list[tk.Frame] = []
     grid_labels: list[ttk.Label] = []
     for index in range(UNIT_FRAME_COUNT):
-        label = ttk.Label(
+        cell = tk.Frame(
             grid_frame,
+            borderwidth=0,
+            highlightthickness=3,
+            highlightbackground="#606060",
+            highlightcolor="#606060",
+        )
+        cell.grid(row=index // GRID_COLUMNS, column=index % GRID_COLUMNS, padx=1, pady=1)
+        label = ttk.Label(
+            cell,
             text=f"{index:02d}",
             width=7,
             anchor="center",
             relief="ridge",
             padding=2,
+            cursor="hand2",
         )
-        label.grid(row=index // GRID_COLUMNS, column=index % GRID_COLUMNS, padx=1, pady=1)
+        label.pack()
+        grid_cells.append(cell)
         grid_labels.append(label)
 
     animation_box = ttk.LabelFrame(controls, text="Анимированный предпросмотр", padding=8)
@@ -1280,13 +1291,21 @@ def run_gui() -> None:
 
     for index, label in enumerate(grid_labels):
         label.bind("<Button-1>", lambda _event, selected=index: select_cell(selected))
+        grid_cells[index].bind(
+            "<Button-1>", lambda _event, selected=index: select_cell(selected)
+        )
 
     def refresh_selection() -> None:
-        for index, label in enumerate(grid_labels):
+        for index, (cell, label) in enumerate(zip(grid_cells, grid_labels)):
+            selected = index == selected_frame_index and index < len(frames)
+            outline = "#ffbf00" if selected else "#606060"
+            cell.configure(
+                background=outline,
+                highlightbackground=outline,
+                highlightcolor=outline,
+            )
             label.configure(
-                relief="sunken"
-                if index == selected_frame_index and index < len(frames)
-                else "ridge"
+                relief="sunken" if selected else "ridge"
             )
 
     def refresh_grid() -> None:
@@ -2218,8 +2237,8 @@ def run_gui() -> None:
         (
             ("Открыть LIT", open_lit_clicked),
             ("Папка LIT", open_lit_folder),
-            ("Экспорт PNG", export_lit_png_clicked),
             ("Импорт PNG", import_lit_png),
+            ("Экспорт PNG", export_lit_png_clicked),
             ("Собрать LIT", save_lit_clicked),
             ("Проверить LIT", validate_lit_clicked),
         ),
